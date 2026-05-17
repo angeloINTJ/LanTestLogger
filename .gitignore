@@ -1,0 +1,17 @@
+# Build output
+build/*.uf2
+build/*.bin
+build/*.elf
+
+# Arduino IDE cache
+/tmp/arduino/
+
+# Claude Code memory
+.claude/
+
+# Spec / planning files (not part of the project)
+deepseek_markdown_*.md
+
+# OS files
+.DS_Store
+Thumbs.db
