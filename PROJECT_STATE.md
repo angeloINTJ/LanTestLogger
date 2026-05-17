@@ -1,7 +1,8 @@
 # Project State — LanTestLogger
 
-> Gerado em: 2026-05-17 01:05  
-> Último firmware flashado: 2026-05-17 00:59 — build v2 com dump, reset e persistência de config.
+> Gerado em: 2026-05-17 13:30  
+> v1.0.0 publicada em https://github.com/angeloINTJ/LanTestLogger
+> Último firmware: 2026-05-17 13:17 — v1.0.0 com web dashboard, ARP scanning, JSON fix
 
 ---
 
@@ -9,11 +10,14 @@
 
 | Arquivo | Descrição |
 |---|---|
-| `PLAN.md` | Especificação original do projeto |
 | `LanTestLogger.ino` | Firmware completo para Raspberry Pi Pico W |
+| `WebDashboard.h` | Servidor web, captive portal DNS, API JSON, dashboard UI |
+| `README.md` | Documentação do projeto (GitHub) |
+| `LICENSE` | Licença MIT |
 | `PROJECT_STATE.md` | Este arquivo — estado atual do projeto |
 | `build.sh` | Script de compilação que salva `.uf2` em `build/` |
 | `build/` | Pasta com firmwares compilados (datados) |
+| `.gitignore` | Artefatos de build ignorados |
 
 ---
 
@@ -25,6 +29,7 @@
 - [x] Log em LittleFS (`/relatorio.csv`) com timestamp, MAC, tipo, resultado, IP
 - [x] Define MAC da interface STA via IOCTL `cur_etheraddr` no driver CYW43439
 - [x] LED pisca a cada tentativa
+- [x] Comandos respondem rapidamente mesmo durante delays (`processCommands()` em todos os loops)
 
 ### Modo AP
 - [x] `ap on` — Pico vira Access Point com SSID/senha configurados
@@ -35,8 +40,30 @@
 - [x] `ap mac XX:XX:XX:XX:XX:XX` — configura MAC do AP via IOCTL `cur_etheraddr` (persistente)
 - [x] `ap mac default` — restaura MAC padrão do hardware
 - [x] `stations` — lista detalhada de dispositivos conectados (MAC, status, tempo)
-- [x] Polling automático via `cyw43_wifi_ap_get_stas` para capturar MACs em tempo real
+- [x] Polling via tabela ARP (`etharp_get_entry`) como workaround para `cyw43_wifi_ap_get_stas` (não funcional no core v5.6.0)
 - [x] Notificação na serial/BT quando dispositivo conecta ou desconecta
+- [x] `processCommands()` ativo no loop do AP mode
+
+### Web Dashboard
+- [x] Servidor web + captive portal (DNS redireciona todos os domínios)
+- [x] Aba Dashboard: estatísticas em tempo real
+- [x] Aba Dispositivos: lista de estações e MACs bloqueados
+- [x] Aba Config: formulário web para configurações
+- [x] Aba AP Debug: visualização de dados de fingerprint capturados
+- [x] API REST: `/api/status`, `/api/config`, `/api/command`, `/api/dump`, `/api/debugdump`
+- [x] Download CSV dos relatórios
+- [x] JSON válido corrigido (objetos com `{` faltante + vírgula extra entre itens)
+
+### Modo Debug (Fingerprinting)
+- [x] `debug` — ativa AP DebugNet (WPA2, canal 1) para captura passiva
+- [x] Varredura ARP via `etharp_get_entry()` para detectar dispositivos conectados
+- [x] Captura DHCP: hostname (option 12), vendor class (option 60), client ID (option 61)
+- [x] Captura HTTP User-Agent de requisições de captive portal
+- [x] Servidor DNS raw na porta 53
+- [x] Salvamento em `/ap_debug.csv` no LittleFS
+- [x] Saída com `q` retorna ao modo STA normal
+- [x] `debugdump` — exporta CSV de debug via serial
+- [x] Visualização no web dashboard (aba AP Debug)
 
 ### Bluetooth
 - [x] `SerialBT` — Bluetooth Classic SPP, nome `PicoTester`
@@ -60,9 +87,10 @@
 - [x] `summary` mostra MACs bloqueados: CONFIRMADOS e PENDENTES com status
 
 ### Persistência
-- [x] Config (SSID, senha, MAC alvo) salva em `/config.dat` no LittleFS
+- [x] Config (SSID, senha, MAC alvo, AP IP/MAC) salva em `/config.dat` no LittleFS
 - [x] Auto-save ao alterar SSID/senha/target via comando
 - [x] Load automático no boot
+- [x] Formato v3 do SavedConfig com AP SSID separado
 
 ---
 
@@ -83,8 +111,8 @@ arduino-cli compile -b rp2040:rp2040:rpipicow:flash=2097152_1048576,ipbtstack=ip
 
 | Métrica | Valor | Limite |
 |---|---|---|
-| Flash (programa) | 552.796 bytes | 1.044.480 (52%) |
-| RAM (globais) | 92.700 bytes | 262.144 (35%) |
+| Flash (programa) | 603.668 bytes | 1.044.480 (58%) |
+| RAM (globais) | 95.028 bytes | 262.144 (36%) |
 
 ---
 
@@ -93,6 +121,14 @@ arduino-cli compile -b rp2040:rp2040:rpipicow:flash=2097152_1048576,ipbtstack=ip
 - **SSID:** `Your_Network_SSID`
 - **Senha:** `your_network_password`
 - **MAC Alvo:** `AA:BB:CC:DD:EE:FF`
+
+---
+
+## GitHub
+
+- **Repositório:** https://github.com/angeloINTJ/LanTestLogger
+- **Licença:** MIT
+- **Release:** v1.0.0
 
 ---
 
@@ -116,41 +152,20 @@ arduino-cli compile -b rp2040:rp2040:rpipicow:flash=2097152_1048576,ipbtstack=ip
 7. **01:00** — Firmware v2 compilado e flashado com sucesso
 8. **08:57** — Adicionado modo AP: comandos `ap on/off/status` e `stations` para rastrear dispositivos conectados via `cyw43_wifi_ap_get_stas`
 9. **09:15** — Adicionados comandos `ap ip` e `ap mac` com persistência no SavedConfig v2; compat retroativa com config v1
-9. **Observação:** Todos os MACs aleatórios testados conectaram na rede configurada — um MAC com bloqueio detectado no CSV
+10. **11:14** — Adicionado modo Debug AP com captura de fingerprint (DHCP, HTTP, ARP)
+11. **11:14** — Criado `WebDashboard.h` com servidor web, captive portal e API REST
+12. **11:14** — Workaround ARP: `cyw43_wifi_ap_get_stas` não funciona no core v5.6.0, substituído por `etharp_get_entry()`
+13. **12:48** — Fix: JSON do `/api/debugdump` sem `{` de abertura nos objetos
+14. **12:48** — Fix: vírgula extra antes do primeiro item no JSON array
+15. **13:17** — Adicionado `processCommands()` em todos os loops de delay e no loop do AP mode
+16. **13:25** — Projeto organizado para GitHub: README, LICENSE, .gitignore, credenciais sanitizadas
+17. **13:30** — v1.0.0 publicada no GitHub
 
 ---
 
-## Para Continuar Amanhã
+## Pendentes / Ideias
 
-### Pendentes / Ideias
-- ~~Exportar relatório CSV do LittleFS via comando~~ → `dump` implementado
-- ~~Reset das estatísticas via comando~~ → `reset` implementado
-- ~~Salvar config (SSID, PASS, target) no LittleFS~~ → implementado (auto-save + load no boot)
-- ~~Notificação Bluetooth quando MAC confirmado~~ → implementado
-- ~~Modo AP para debug de dispositivos~~ → implementado (`ap on/off/status`, `stations`)
 - Verificar se o MAC alvo realmente está bloqueado na rede (até agora conectou)
 - Modo deep sleep entre ciclos para economia de energia
 - Salvar/Carregar `log_enabled` na config persistente
 - Exibir IP dos dispositivos conectados ao AP (via leases DHCP)
-
-### Como testar
-1. Conectar USB e monitorar:
-   ```bash
-   cat /dev/ttyACM0
-   ```
-2. Enviar comandos em outro terminal:
-   ```bash
-   printf "help\n" > /dev/ttyACM0
-   printf "summary\n" > /dev/ttyACM0
-   ```
-3. Ou conectar via Bluetooth ao dispositivo `PicoTester`
-
-### Se precisar recompilar e flashar
-```bash
-# Compilar
-./build.sh
-
-# Colocar Pico em BOOTSEL, depois:
-cp build/LanTestLogger-$(date +%Y-%m-%d).uf2 /media/angelo/RPI-RP2/
-sync
-```
