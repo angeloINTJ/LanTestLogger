@@ -92,6 +92,16 @@ pre{background:#0a0a14;border-radius:6px;padding:8px;font-size:11px;overflow-x:a
         <div class="stat-box"><div class="num" id="sCycles">0</div><div class="lbl">Ciclos</div></div>
       </div>
     </div>
+    <div class="card" id="ouiCard">
+      <h2>Bloqueio por OUI</h2>
+      <div id="ouiStats"><p style="color:#666;text-align:center;padding:10px">Aguardando dados...</p></div>
+    </div>
+    <div class="card" id="liveLogCard">
+      <h2>Live Log <span style="font-size:10px;color:#666;font-weight:400" id="liveStatus">conectando...</span></h2>
+      <div id="liveLog" style="max-height:250px;overflow-y:auto;font-family:'SF Mono',Monaco,monospace;font-size:11px">
+        <p style="color:#666;text-align:center;padding:10px">Aguardando eventos...</p>
+      </div>
+    </div>
     <div class="btn-group">
       <button class="btn primary" onclick="runCmd('summary')">Summary</button>
       <button class="btn info" onclick="runCmd('dump')">CSV Dump</button>
@@ -195,6 +205,21 @@ async function api(url, opts) {
 }
 
 // Format time
+function renderOUIStats(data) {
+  const el = document.getElementById('ouiStats');
+  if (!data.ouis || data.ouis.length === 0) {
+    el.innerHTML = '<p style="color:#666;text-align:center;padding:10px">Sem dados de OUI ainda.</p>';
+    return;
+  }
+  const maxBloq = Math.max(...data.ouis.map(o => o.bloqueados), 1);
+  let h = '';
+  data.ouis.forEach(o => {
+    const pct = (o.bloqueados / maxBloq * 100).toFixed(0);
+    h += `<div style="margin:4px 0"><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:1px"><span>${o.nome}</span><span style="color:#a29bfe">${o.taxa.toFixed(0)}% (${o.bloqueados}/${o.testados})</span></div><div style="background:#0f0f1c;border-radius:4px;height:12px"><div style="background:linear-gradient(90deg,#6c5ce7,#a29bfe);border-radius:4px;height:12px;width:${pct}%;transition:width .3s"></div></div></div>`;
+  });
+  el.innerHTML = h;
+}
+
 function fmtTime(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
   return `${h}h${String(m).padStart(2,'0')}m${String(s).padStart(2,'0')}s`;
@@ -310,6 +335,7 @@ async function fetchAll() {
   renderDashboard(status);
   renderStations(status);
   if (status.blocked) renderBlocked(status);
+  if (status.ouis) renderOUIStats(status);
 }
 function doFetch() { fetchAll(); }
 
@@ -340,25 +366,111 @@ async function loadDebugData() {
   el.innerHTML = html;
 }
 
-// Init
-fetchAll();
-loadConfig();
-loadDebugData();
-setInterval(doFetch, 5000);
+// Live event log
+let lastEventSeq = 0;
+const eventColors = {
+  test_start: '#a29bfe',
+  phase_change: '#60a5fa',
+  result: '#4ade80',
+  blocked: '#f87171',
+  conn_test: '#fbbf24',
+  info: '#888'
+};
+
+async function pollEvents() {
+  try {
+    const r = await fetch(API + '/events?since=' + lastEventSeq);
+    if (!r.ok) return;
+    const events = await r.json();
+    if (!Array.isArray(events) || events.length === 0) {
+      document.getElementById('liveStatus').textContent = 'ativo';
+      return;
+    }
+    document.getElementById('liveStatus').textContent = events.length + ' novos';
+
+    const log = document.getElementById('liveLog');
+    // Remove placeholder on first events
+    if (lastEventSeq === 0) log.innerHTML = '';
+
+    events.forEach(ev => {
+      lastEventSeq = Math.max(lastEventSeq, ev.seq);
+      const color = eventColors[ev.type] || '#888';
+      const time = new Date(ev.ts).toLocaleTimeString();
+      const line = document.createElement('div');
+      line.style.cssText = `padding:2px 4px;margin:1px 0;border-left:2px solid ${color};padding-left:6px`;
+      line.innerHTML = `<span style="color:#666;font-size:10px">${time}</span> <span style="color:${color};font-weight:600">[${ev.type}]</span> <span style="color:#ccc;font-size:10px">${ev.mac||''}</span> <span style="color:#999">${ev.detail||''}</span>`;
+      log.appendChild(line);
+    });
+    // Auto-scroll
+    log.scrollTop = log.scrollHeight;
+    // Keep max 150 lines
+    while (log.children.length > 150) log.firstChild.remove();
+  } catch(e) {
+    document.getElementById('liveStatus').textContent = 'erro';
+  }
+}
+
+// Init — serializado para nao sobrecarregar o servidor
+(async function init() {
+  await fetchAll();
+  await loadConfig();
+  await loadDebugData();
+  lastEventSeq = 0;
+  await pollEvents();
+})();
+setInterval(pollEvents, 2000);    // poll a cada 2s
+setInterval(doFetch, 15000);      // refresh completo a cada 15s
 </script>
 </body>
 </html>
 )rawliteral";
 
+// ---------- EVENT BUFFER (live log) ----------
+#define MAX_EVENTS 60
+struct LiveEvent {
+  unsigned long seq;
+  char type[16];
+  char mac[18];
+  char detail[64];
+  unsigned long ts;
+};
+static LiveEvent eventBuf[MAX_EVENTS];
+static unsigned long eventSeq = 0;
+static int eventCount = 0;
+
+void pushEvent(const char *type, const char *mac, const char *detail) {
+  int idx = eventCount % MAX_EVENTS;
+  eventSeq++;
+  eventBuf[idx].seq = eventSeq;
+  snprintf(eventBuf[idx].type, sizeof(eventBuf[idx].type), "%s", type);
+  snprintf(eventBuf[idx].mac, sizeof(eventBuf[idx].mac), "%s", mac);
+  snprintf(eventBuf[idx].detail, sizeof(eventBuf[idx].detail), "%s", detail);
+  eventBuf[idx].ts = millis();
+  eventCount++;
+}
+
 // ---------- GLOBALS ----------
 static WebServer webServer(80);
-static DNSServer dnsServer;
-static bool webActive = false;
+DNSServer dnsServer;
+bool webActive = false;
 static bool apAPIMode = false;  // tracks if we're in AP mode for API responses
 
 // Command output capture (defined in main .ino)
 extern char cmd_output_buf[1024];
 extern bool cmd_output_capture;
+
+// Phase stats (defined in main .ino)
+struct PhaseCounters;
+extern PhaseCounters phaseStats;
+
+// OUI stats (defined in main .ino)
+struct OUIStat;
+extern int oui_stats_count;
+extern OUIStat oui_stats[10];
+
+// Connectivity test stats (defined in main .ino)
+struct ConnTestStats;
+extern ConnTestStats connStats;
 
 // ---------- HELPERS ----------
 static String jsonStr(const char *s) {
@@ -422,6 +534,39 @@ static void handleAPIStatus() {
   json += "  \"exact_connected\":" + String(stats.exact_connected) + ",\n";
   json += "  \"exact_blocked\":" + String(stats.exact_blocked) + "\n";
   json += "},\n";
+
+  // Phase distribution
+  json += "\"phases\":{\n";
+  json += "  \"scan_fail\":" + String(phaseStats.phase_scan_fail) + ",\n";
+  json += "  \"auth_fail\":" + String(phaseStats.phase_auth_fail) + ",\n";
+  json += "  \"assoc_fail\":" + String(phaseStats.phase_assoc_fail) + ",\n";
+  json += "  \"handshake_fail\":" + String(phaseStats.phase_handshake_fail) + ",\n";
+  json += "  \"dhcp_fail\":" + String(phaseStats.phase_dhcp_fail) + ",\n";
+  json += "  \"connected\":" + String(phaseStats.phase_connected) + "\n";
+  json += "},\n";
+
+  // Connectivity test stats
+  json += "\"connectivity\":{\n";
+  json += "  \"total_tested\":" + String(connStats.total_tested) + ",\n";
+  json += "  \"ping_ok\":" + String(connStats.ping_ok) + ",\n";
+  json += "  \"ping_fail\":" + String(connStats.ping_fail) + ",\n";
+  json += "  \"dns_ok\":" + String(connStats.dns_ok) + ",\n";
+  json += "  \"dns_fail\":" + String(connStats.dns_fail) + ",\n";
+  json += "  \"http_ok\":" + String(connStats.http_ok) + ",\n";
+  json += "  \"http_fail\":" + String(connStats.http_fail) + "\n";
+  json += "},\n";
+
+  // OUI stats
+  json += "\"ouis\":[\n";
+  for (int i = 0; i < oui_stats_count; i++) {
+    if (i > 0) json += ",\n";
+    float taxa = oui_stats[i].testados > 0 ? 100.0 * oui_stats[i].bloqueados / oui_stats[i].testados : 0.0;
+    json += "  {\"nome\":" + jsonStr(oui_stats[i].nome) + ",";
+    json += "\"testados\":" + String(oui_stats[i].testados) + ",";
+    json += "\"bloqueados\":" + String(oui_stats[i].bloqueados) + ",";
+    json += "\"taxa\":" + String(taxa, 1) + "}";
+  }
+  json += "\n],\n";
 
   // Stations
   json += "\"stations\":[\n";
@@ -679,29 +824,109 @@ static void handleAPIDebugDump() {
   webServer.send(200, "application/json", json);
 }
 
+// ---------- API: LIVE EVENTS ----------
+static void handleAPIEvents() {
+  unsigned long since = 0;
+  if (webServer.hasArg("since")) {
+    since = strtoul(webServer.arg("since").c_str(), NULL, 10);
+  }
+
+  String json = "[";
+  bool first = true;
+  int total = eventCount < MAX_EVENTS ? eventCount : MAX_EVENTS;
+  int startIdx = eventCount > MAX_EVENTS ? eventCount - MAX_EVENTS : 0;
+
+  for (int i = 0; i < total; i++) {
+    int idx = (startIdx + i) % MAX_EVENTS;
+    if (eventBuf[idx].seq <= since) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"seq\":" + String(eventBuf[idx].seq) + ",";
+    json += "\"type\":" + jsonStr(eventBuf[idx].type) + ",";
+    json += "\"mac\":" + jsonStr(eventBuf[idx].mac) + ",";
+    json += "\"detail\":" + jsonStr(eventBuf[idx].detail) + ",";
+    json += "\"ts\":" + String(eventBuf[idx].ts);
+    json += "}";
+  }
+  json += "]";
+
+  webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.send(200, "application/json", json);
+}
+
 // ---------- CATCH-ALL / CAPTIVE PORTAL ----------
+extern bool captive_enabled;
+
 static void handleRoot() {
+  webServer.sendHeader("Cache-Control", "public, max-age=3600");
   webServer.send_P(200, PSTR("text/html"), DASHBOARD_HTML);
+}
+
+static void handle404() {
+  webServer.send(404, "text/plain", "Not Found");
+}
+
+// Captive portal probes — respostas corretas para simular internet
+static void handleAndroid204() {
+  webServer.send(204, "text/plain", "");
+}
+static void handleAppleHotspot() {
+  webServer.send(200, "text/html", "Success");
+}
+static void handleNCSI() {
+  webServer.send(200, "text/plain", "Microsoft NCSI");
+}
+static void handleSuccess() {
+  webServer.send(200, "text/plain", "success");
+}
+static void handleFavicon() {
+  webServer.send(204, "text/plain", "");
+}
+
+void updateCaptivePortal() {
+  if (captive_enabled) {
+    dnsServer.start(53, "*", WiFi.softAPIP());
+  } else {
+    dnsServer.stop();
+  }
 }
 
 // ---------- INIT / HANDLE / STOP ----------
 void initWebDashboard() {
-  // Start DNS server (captive portal: resolve all domains to our IP)
   IPAddress apIP = WiFi.softAPIP();
-  dnsServer.start(53, "*", apIP);
+  if (captive_enabled) {
+    dnsServer.start(53, "*", apIP);
+  }
 
-  // Start web server
   webServer.on("/", handleRoot);
   webServer.on("/api/status", handleAPIStatus);
   webServer.on("/api/config", handleAPIConfig);
   webServer.on("/api/command", handleAPICommand);
   webServer.on("/api/dump", handleAPIDump);
   webServer.on("/api/debugdump", handleAPIDebugDump);
-  webServer.onNotFound(handleRoot); // captive portal: everything serves the dashboard
+  webServer.on("/api/events", handleAPIEvents);
+  // Captive portal probes
+  webServer.on("/generate_204", handleAndroid204);
+  webServer.on("/gen_204", handleAndroid204);
+  webServer.on("/hotspot-detect.html", handleAppleHotspot);
+  webServer.on("/library/test/success.html", handleAppleHotspot);
+  webServer.on("/ncsi.txt", handleNCSI);
+  webServer.on("/connecttest.txt", handleNCSI);
+  webServer.on("/redirect", handleRoot);
+  webServer.on("/success.txt", handleSuccess);
+  webServer.on("/mobile/status.php", handleSuccess);
+  webServer.on("/favicon.ico", handleFavicon);
+  if (captive_enabled) {
+    webServer.onNotFound(handleRoot);
+  } else {
+    webServer.onNotFound(handle404);
+  }
   webServer.begin();
 
   webActive = true;
-  replyf("Web dashboard: http://%s\n", apIP.toString().c_str());
+  replyf("Web dashboard: http://%s  captive=%s\n", apIP.toString().c_str(),
+         captive_enabled ? "ON" : "OFF");
 }
 
 void handleWebDashboard() {

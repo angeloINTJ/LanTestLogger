@@ -1,23 +1,41 @@
-# LanTestLogger
+# LanTestLogger v2.0
 
-**MAC address spoofer and network debug tool for the Raspberry Pi Pico W.**
+**MAC address spoofer and WiFi diagnostic tool for Raspberry Pi Pico W.**
 
-Tests random and targeted MAC addresses against a WiFi network to detect MAC filtering and blocking. Features a dual-mode AP for real-time device fingerprinting (DHCP options, HTTP User-Agent), dual-channel logging (USB + Bluetooth), and a web dashboard for remote control.
+Tests random and targeted MAC addresses against a WiFi network to detect MAC filtering and blocking at every layer. Features 9-phase connection diagnostics, multi-vendor OUI profiles, post-connection connectivity tests, blacklist policy detection, dual-core web dashboard with live event log, captive portal with internet simulation, TCP/MQTT remote access, and Bluetooth SPP.
+
+---
+
+## What's New in v2.0
+
+- **9-phase connection diagnostics** — Know exactly WHERE a block occurs (SCAN → AUTH → ASSOC → HANDSHAKE → DHCP → CONNECTED) with reason codes
+- **10 OUI profiles** — Test blocking by vendor (Apple, Samsung, Intel, Broadcom, Qualcomm, Xiaomi, Huawei, Nvidia, Realtek)
+- **Post-connection tests** — Ping gateway, DNS resolution, HTTP GET after successful WiFi association
+- **Blacklist policy detection** — Timeout-based retesting (5/15/30/60min) + rate limiting detection
+- **Dual-core architecture** — Core 1 dedicated to web dashboard + DNS for maximum responsiveness
+- **Live event log** — Real-time dashboard with color-coded connection events
+- **Internet simulation** — Proper captive portal probe responses (Android HTTP 204, Apple "Success", Windows NCSI)
+- **TCP remote control** — Command interface on port 2323
+- **MQTT publisher** — Status published to broker every 30s
+- **Separate AP credentials** — Independent SSID and password for Access Point mode
 
 ---
 
 ## Features
 
-- **MAC spoofing** — Tests random MACs (prefix `C8:A6:EF`) plus a user-defined target MAC
+- **MAC spoofing** — Tests random MACs (10 selectable OUI prefixes) plus a user-defined target MAC
+- **9-phase diagnostics** — Tracks every WiFi connection state: SCAN, AUTH, ASSOC, HANDSHAKE, DHCP
 - **24-hour test cycle** — Configurable duration, saves CSV report to LittleFS when complete
+- **Vendor profiling** — Detects vendor-specific blocking patterns with per-OUI statistics
+- **Post-connection tests** — Ping, DNS, and HTTP verification of real internet access
+- **Policy tests** — `blacklist-policy` (timeout detection) and `ratelimit-test` (rate limiting)
 - **Device fingerprinting** — DebugNet AP captures hostnames, DHCP vendor class, client ID, and HTTP User-Agent
+- **Dual-core web dashboard** — Full remote control via captive portal with live event log
+- **Internet simulation** — Responds to Android/iOS/Windows captive portal probes so devices stay connected
 - **Dual logging** — USB Serial + Bluetooth Classic SPP simultaneously
-- **Web dashboard** — Full remote control with captive portal (DNS redirects all domains)
-- **Command interface** — Control everything via USB or Bluetooth serial commands
-- **Persistent configuration** — SSID, password, target MAC, AP settings saved on LittleFS
-- **MAC blocking detection** — Tracks blocked MACs with automatic retest for confirmation
-- **AP mode** — Standalone Access Point with real-time station monitoring
-- **ARP-based station scanning** — Detects connected devices via lwIP ARP table iteration
+- **TCP command server** — Remote control via telnet on port 2323 (up to 3 clients)
+- **MQTT publisher** — Publishes status JSON to MQTT broker every 30s
+- **Persistent configuration** — All settings saved on LittleFS (SavedConfig v5, backward compatible)
 
 ## Hardware Requirements
 
@@ -26,7 +44,7 @@ Tests random and targeted MAC addresses against a WiFi network to detect MAC fil
 | Raspberry Pi Pico W | RP2040 + CYW43439 WiFi/BT |
 | USB Micro cable | Power and serial communication |
 
-No external wiring required — the Pico W's built-in CYW43439 handles all wireless communication.
+No external wiring required.
 
 ## Board Configuration (Arduino IDE)
 
@@ -40,19 +58,7 @@ No external wiring required — the Pico W's built-in CYW43439 handles all wirel
 ### arduino-cli
 
 ```bash
-arduino-cli compile -b rp2040:rp2040:rpipicow:flash=2097152_1048576,ipbtstack=ipv4btcble /path/to/LanTestLogger
-```
-
-### Upload
-
-1. Hold the **BOOTSEL** button on the Pico W
-2. Connect USB while holding BOOTSEL
-3. Release BOOTSEL — the Pico mounts as a mass storage device
-4. Copy the `.uf2` file:
-
-```bash
-cp build/LanTestLogger-*.uf2 /media/$USER/RPI-RP2/
-sync
+arduino-cli compile -b rp2040:rp2040:rpipicow:flash=2097152_1048576,ipbtstack=ipv4btcble .
 ```
 
 ### Build Script
@@ -61,54 +67,107 @@ sync
 ./build.sh
 ```
 
-Compiles the firmware and saves a dated `.uf2` to `build/`.
+Compiles and saves a dated `.uf2` to `build/`.
+
+### Upload
+
+1. Hold **BOOTSEL** button on the Pico W
+2. Connect USB while holding BOOTSEL
+3. Release BOOTSEL — Pico mounts as RPI-RP2
+4. Copy the `.uf2` file:
+
+```bash
+cp build/LanTestLogger-*.uf2 /media/$USER/RPI-RP2/
+sync
+```
+
+## Quick Start
+
+1. Connect Pico W via USB
+2. Open serial monitor at **115200 baud**
+3. Configure your network credentials:
+   ```
+   ssid YourNetworkName
+   pass YourPassword
+   ```
+4. The device auto-starts the 24-hour test cycle
+5. Type `help` to list all commands
 
 ## Configuration
 
-Edit the credentials at the top of `LanTestLogger.ino` before compiling:
+Edit `LanTestLogger.ino` before compiling, or change at runtime via serial commands:
 
 ```cpp
 char config_ssid[64]    = "Your_Network_SSID";
 char config_pass[64]    = "your_network_password";
 char config_ap_ssid[64] = "PicoTester";
-uint8_t config_mac_alvo[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+char config_ap_pass[64] = "12345678";
 ```
 
-All settings can also be changed at runtime via serial commands and are persisted to LittleFS.
-
-## Quick Start
-
-1. Connect the Pico W via USB
-2. Open a serial monitor at **115200 baud**
-3. Configure your network credentials (see above)
-4. The device automatically starts the 24-hour test cycle
-5. Type `help` to list all commands
+### Default AP Credentials
+- **SSID:** `PicoTester`
+- **Password:** `12345678`
 
 ## Commands
 
+### Core
 | Command | Description |
 |---------|-------------|
 | `help` | List all commands |
-| `summary` | Full statistics and blocked MAC report |
+| `summary` | Full statistics, phase distribution, per-OUI rates, blocked MACs |
 | `dump` | Export CSV test report from LittleFS |
 | `debugdump` | Export AP debug capture CSV |
 | `reset` | Reset statistics, counters, and queues |
+| `clearlog` | Delete all log files from LittleFS |
+
+### Network Config
+| Command | Description |
+|---------|-------------|
 | `ssid <name>` | Change target WiFi SSID (persistent) |
 | `pass <pass>` | Change WiFi password (persistent) |
 | `target <mac>` | Change target MAC (persistent) |
 | `log on/off` | Enable/disable verbose logging |
+
+### OUI Profiles
+| Command | Description |
+|---------|-------------|
+| `oui list` | List all 10 OUI profiles (Generico, Apple, Samsung, Intel, Broadcom, Qualcomm, Xiaomi, Huawei, Nvidia, Realtek) |
+| `oui <name>` | Select vendor profile (e.g., `oui Apple`) |
+| `oui all` | Rotate mode: cycles through all OUIs |
+
+### AP Mode
+| Command | Description |
+|---------|-------------|
 | `ap on/off` | Enable/disable AP mode |
 | `ap status` | Show AP status, IP, connected stations |
 | `ap ip <ip> <gw> <mask>` | Configure AP IP address (persistent) |
 | `ap ip default` | Restore default AP IP (192.168.4.1) |
 | `ap mac <mac>` | Configure AP MAC address (persistent) |
-| `ap mac default` | Restore default hardware MAC |
+| `ap mac default` | Restore hardware MAC |
+| `ap ssid <name>` | Change AP SSID (persistent) |
+| `ap pass <pass>` | Change AP password (persistent) |
 | `stations` | List connected devices with MAC, status, uptime |
+| `captive on/off` | Enable/disable captive portal DNS redirection |
+
+### Remote Access
+| Command | Description |
+|---------|-------------|
+| `tcp on/off` | TCP command server on port 2323 |
+| `tcp status` | Show connected TCP clients |
+| `mqtt <ip> [port]` | Configure MQTT broker |
+| `mqtt off` | Disable MQTT |
+
+### Diagnostics
+| Command | Description |
+|---------|-------------|
+| `blacklist-policy` | Test blacklist timeout (retests at 5/15/30/60min) |
+| `ratelimit-test` | Detect rate limiting (fast burst vs slow) |
 | `debug` | Enter DebugNet AP for device fingerprinting |
+| `monitor on/off/status` | Experimental monitor mode (WLC_SET_MONITOR) |
 
 ## Web Dashboard
 
-When AP mode is active (`ap on`), connect to the **PicoTester** WiFi network and open any URL in a browser — the captive portal redirects to:
+When AP mode is active (`ap on`), connect to **PicoTester** WiFi (password: `12345678`) and open any URL — the captive portal redirects to:
 
 ```
 http://192.168.4.1
@@ -118,60 +177,73 @@ http://192.168.4.1
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Real-time stats — connected count, blocked count, cycles, uptime |
+| **Dashboard** | Real-time stats, OUI blocking bars, live event log |
 | **Dispositivos** | Connected station list + blocked MACs with confirmation status |
-| **Config** | Edit SSID, password, AP IP/MAC, target MAC via web forms |
+| **Config** | Edit SSID, passwords, AP IP/MAC, target MAC via web forms |
 | **AP Debug** | View captured device fingerprints from DebugNet mode |
+
+### Internet Simulation
+
+The captive portal responds correctly to OS connectivity probes:
+- **Android:** `GET /generate_204` → HTTP 204
+- **iOS/Apple:** `GET /hotspot-detect.html` → "Success"
+- **Windows:** `GET /ncsi.txt` → "Microsoft NCSI"
+
+Devices will show WiFi as connected with internet access and stay associated.
 
 ### API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/status` | GET | Full status JSON (stats, stations, blocked) |
+| `/api/status` | GET | Full status JSON (stats, stations, blocked, phases, OUI, connectivity) |
 | `/api/config` | GET/POST | Read or write configuration |
 | `/api/command` | POST | Execute a serial command (JSON: `{"cmd":"summary"}`) |
 | `/api/dump` | GET | Download test report as CSV |
 | `/api/debugdump` | GET | Download AP debug data as CSV (`?dl=1`) or JSON |
-
-All domains resolve to the dashboard via DNS (captive portal).
+| `/api/events` | GET | Live event log since sequence number (`?since=N`) |
 
 ## Bluetooth
 
-The device broadcasts a Bluetooth Classic SPP connection named **PicoTester**. Connect with any SPP-compatible app to receive real-time serial output and send commands — identical to the USB serial interface.
-
----
+The device broadcasts Bluetooth Classic SPP as **PicoTester**. Connect with any SPP-compatible app for real-time serial output and commands.
 
 ## How It Works
 
-### MAC Testing
+### MAC Testing (9-Phase Diagnostics)
 
-1. Generates random MAC addresses with the `C8:A6:EF` OUI prefix
-2. Sets the STA interface MAC via CYW43439 IOCTL (`cur_etheraddr`)
-3. Attempts to connect to the configured WiFi network
-4. Logs the result (timestamp, MAC, type, success/fail, IP) to LittleFS CSV
-5. MACs that fail consistently are flagged as potentially blocked
-6. Blocked MACs enter a retest queue for confirmation (2 additional cycles)
+1. Generates random MACs with the selected OUI prefix
+2. Sets the STA interface MAC via CYW43439 IOCTL (`cur_etheraddr`) and updates lwIP netif
+3. Attempts connection and tracks each phase:
+   - `SCAN` — Is the SSID visible?
+   - `AUTH` — Does the AP accept authentication? (`BADAUTH` = MAC blocked at radio level)
+   - `ASSOC` — Does association succeed?
+   - `HANDSHAKE` — Does the 4-way WPA handshake complete?
+   - `DHCP` — Is an IP address assigned?
+   - `CONNECTED` — Full connectivity confirmed
+4. Post-connection tests verify real internet access (ping, DNS, HTTP)
+5. Failed MACs are enqueued for retesting (2 additional cycles for confirmation)
+6. Confirmed blocked MACs can be tested for timeout-based policies
 
 ### AP Debug Mode
 
-The `debug` command creates a dedicated **DebugNet** AP (WPA2, channel 1) for passive device fingerprinting:
+The `debug` command creates a **DebugNet** AP (WPA2, channel 1) for passive device fingerprinting:
 
-- **ARP scanning** — Iterates the lwIP ARP table via `etharp_get_entry()` to detect connected stations (the `cyw43_wifi_ap_get_stas()` API is non-functional on Pico W core v5.6.0)
-- **DHCP passive capture** — Listens on port 67 for DHCP Discover/Request packets to extract hostname (option 12), vendor class (option 60), and client identifier (option 61). Note: the built-in lwIP DHCP server consumes DHCPACK, so option capture is one-way
-- **HTTP capture** — Serves a minimal HTTP endpoint that records User-Agent headers from captive portal probes
-- **DNS** — Raw UDP DNS server on port 53 responds to all queries with the AP IP
-- All captured data is saved to `/ap_debug.csv` on LittleFS
-- Press `q` to exit and return to normal STA mode
+- **ARP scanning** — Iterates lwIP ARP table via `etharp_get_entry()`
+- **DHCP capture** — Listens on port 67 for options 12 (hostname), 60 (vendor class), 61 (client ID)
+- **HTTP capture** — Records User-Agent from captive portal probes
+- **DNS** — Raw UDP DNS server on port 53
 
-### Station Detection
+### Dual-Core Architecture
 
-Station detection in AP mode uses `etharp_get_entry()` from the lwIP stack to iterate the ARP table — the only reliable method on the Pico W core v5.6.0, since the native `cyw43_wifi_ap_get_stas()` driver call always returns zero entries.
+- **Core 0:** Main test loop, serial/BT commands, TCP server, MQTT
+- **Core 1:** Web dashboard + DNS server (tight loop, no delays)
 
 ## Project Structure
 
 ```
-├── LanTestLogger.ino      # Main firmware (setup, loop, commands, debug mode)
+├── LanTestLogger.ino      # Main firmware (setup, loop, commands, debug mode, core1)
 ├── WebDashboard.h         # Web server, captive portal DNS, JSON API, dashboard UI
+├── ConfigManager.h        # LittleFS persistence, SavedConfig v5, utilities
+├── TCPMQTT.h              # TCP command server + minimal MQTT client
 ├── build.sh               # Compile script (outputs dated .uf2 to build/)
 ├── build/                 # Compiled firmware binaries
 ├── README.md              # This file
@@ -184,20 +256,21 @@ Station detection in AP mode uses `etharp_get_entry()` from the lwIP stack to it
 
 | Metric | Value | Limit | Usage |
 |--------|-------|-------|-------|
-| Flash (program) | ~604 KB | 1,044,480 | ~58% |
-| RAM (globals) | ~95 KB | 262,144 | ~36% |
+| Flash (program) | ~630 KB | 1,044,480 | ~60% |
+| RAM (globals) | ~102 KB | 262,144 | ~39% |
 
 ## Limitations
 
-- **DHCP option capture is one-way** — the built-in lwIP DHCP server on port 67 consumes ACK packets before the raw UDP listener can read them. Discover and Request options are captured; ACK options are not.
-- **`cyw43_wifi_ap_get_stas()` is non-functional** on Pico W core v5.6.0 — station detection relies on ARP table scanning as a workaround.
-- **Coexistence** — STA + AP simultaneous mode is not supported by the CYW43439 firmware on this core. Use `ap on` to switch to AP mode or `debug` for the DebugNet.
+- **DHCP option capture is one-way** — lwIP DHCP server consumes ACK packets before raw UDP listener
+- **`cyw43_wifi_ap_get_stas()` is non-functional** on Pico W core v5.6.0 — station detection uses ARP table scanning
+- **Coexistence** — STA + AP simultaneous mode not supported by CYW43439 firmware on this core
+- **Monitor mode** — `WLC_SET_MONITOR` IOCTL is compiled out of the CYW43 driver (`#if 0`)
 
 ## License
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## See Also
 
-- [DHT22PIO_RP2040](https://github.com/angeloINTJ/DHT22PIO_RP2040) — PIO-accelerated DHT22 library by the same author
-- [OneWirePIO_RP2040](https://github.com/angeloINTJ/OneWirePIO_RP2040) — PIO-accelerated DS18B20 library by the same author
+- [DHT22PIO_RP2040](https://github.com/angeloINTJ/DHT22PIO_RP2040) — PIO-accelerated DHT22 library
+- [OneWirePIO_RP2040](https://github.com/angeloINTJ/OneWirePIO_RP2040) — PIO-accelerated DS18B20 library

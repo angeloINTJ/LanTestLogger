@@ -3,6 +3,8 @@
 #include <pico/cyw43_arch.h>
 #include <SerialBT.h>
 #include "lwip/etharp.h"
+#include "lwip/dhcp.h"
+#include "ConfigManager.h"
 
 // =============================================
 // CONFIGURAÇÕES INICIAIS (editáveis via comando)
@@ -10,27 +12,81 @@
 char config_ssid[64]    = "Your_Network_SSID";
 char config_pass[64]    = "your_network_password";
 char config_ap_ssid[64] = "PicoTester";
+char config_ap_pass[64] = "12345678";
 uint8_t config_mac_alvo[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+
+// =============================================
+// PERFIS OUI (Organizational Unique Identifier)
+// =============================================
+struct OUIProfile {
+  const char *nome;
+  uint8_t prefixo[3];
+};
+
+OUIProfile perfis_oui[] = {
+  {"Generico",   {0xC8, 0xA6, 0xEF}},
+  {"Apple",      {0x00, 0x1E, 0xC2}},
+  {"Samsung",    {0xCC, 0x05, 0x77}},
+  {"Intel",      {0x00, 0x1C, 0xBF}},
+  {"Broadcom",   {0x00, 0x10, 0x18}},
+  {"Qualcomm",   {0x00, 0x0A, 0xF7}},
+  {"Xiaomi",     {0x8C, 0x85, 0x90}},
+  {"Huawei",     {0x28, 0x6E, 0xD4}},
+  {"Nvidia",     {0x00, 0x04, 0x4B}},
+  {"Realtek",    {0x00, 0xE0, 0x4C}},
+};
+const int OUI_COUNT = sizeof(perfis_oui) / sizeof(perfis_oui[0]);
+
+int oui_ativo = 0;           // indice do perfil ativo
+bool oui_rotativo = false;   // true = alterna entre todos os perfis
+int oui_ciclo_atual = 0;     // contador para modo rotativo
+
+// Estatisticas por OUI
+#define MAX_OUI_STATS 10
+struct OUIStat {
+  char nome[16];
+  unsigned long testados;
+  unsigned long bloqueados;
+};
+OUIStat oui_stats[MAX_OUI_STATS];
+int oui_stats_count = 0;
+
+String ouiNomeAtivo() {
+  return String(perfis_oui[oui_ativo].nome);
+}
+
+String ouiDoMAC(const uint8_t *mac) {
+  for (int i = 0; i < OUI_COUNT; i++) {
+    if (mac[0] == perfis_oui[i].prefixo[0] &&
+        mac[1] == perfis_oui[i].prefixo[1] &&
+        mac[2] == perfis_oui[i].prefixo[2]) {
+      return String(perfis_oui[i].nome);
+    }
+  }
+  return "Desconhecido";
+}
+
+void registrarOUIStat(const String &oui, bool bloqueado) {
+  for (int i = 0; i < oui_stats_count; i++) {
+    if (strcmp(oui_stats[i].nome, oui.c_str()) == 0) {
+      oui_stats[i].testados++;
+      if (bloqueado) oui_stats[i].bloqueados++;
+      return;
+    }
+  }
+  if (oui_stats_count < MAX_OUI_STATS) {
+    snprintf(oui_stats[oui_stats_count].nome, sizeof(oui_stats[oui_stats_count].nome),
+             "%s", oui.c_str());
+    oui_stats[oui_stats_count].testados = 1;
+    oui_stats[oui_stats_count].bloqueados = bloqueado ? 1 : 0;
+    oui_stats_count++;
+  }
+}
 
 const unsigned long DURACAO_TESTE_SEG = 86400;
 const unsigned long INTERVALO_ENTRE_TENTATIVAS_SEG = 30;
 const char* CSV_FILENAME = "/relatorio.csv";
 const char* CONFIG_FILENAME = "/config.dat";
-
-// Configuração persistente salva no LittleFS
-#define SAVED_CONFIG_VERSION 3
-
-struct SavedConfig {
-  uint32_t version;
-  char ssid[64];
-  char pass[64];
-  uint8_t target_mac[6];
-  uint8_t ap_mac[6];        // AP MAC (zeros = usar padrão do hardware)
-  uint8_t ap_ip[4];          // AP IP / gateway / subnet
-  uint8_t ap_gateway[4];
-  uint8_t ap_subnet[4];
-  char ap_ssid[64];          // SSID separado para o AP (v3+)
-};
 
 // =============================================
 // LISTA DE MACs BLOQUEADOS
@@ -73,6 +129,146 @@ struct {
   unsigned long exact_errors = 0;
   unsigned long total_cycles = 0;
 } stats;
+
+// =============================================
+// FASES DE CONEXAO
+// =============================================
+enum ConnPhase {
+  PHASE_NONE = 0,
+  PHASE_SCAN_OK,        // SSID encontrado no scan
+  PHASE_SCAN_FAIL,      // SSID nao encontrado
+  PHASE_AUTH_FAIL,      // falha na autenticacao
+  PHASE_ASSOC_FAIL,     // falha na associacao
+  PHASE_HANDSHAKE_FAIL, // falha no 4-way handshake
+  PHASE_DHCP_FAIL,      // conectou mas sem DHCP
+  PHASE_CONNECTED,      // conexao completa com IP
+  PHASE_MAC_SET_FAIL    // falha ao definir MAC
+};
+
+const char* phaseName(uint8_t p) {
+  switch (p) {
+    case PHASE_NONE:            return "NONE";
+    case PHASE_SCAN_OK:         return "SCAN_OK";
+    case PHASE_SCAN_FAIL:       return "SCAN_FAIL";
+    case PHASE_AUTH_FAIL:       return "AUTH_FAIL";
+    case PHASE_ASSOC_FAIL:      return "ASSOC_FAIL";
+    case PHASE_HANDSHAKE_FAIL:  return "HANDSHAKE_FAIL";
+    case PHASE_DHCP_FAIL:       return "DHCP_FAIL";
+    case PHASE_CONNECTED:       return "CONNECTED";
+    case PHASE_MAC_SET_FAIL:    return "MAC_SET_FAIL";
+    default:                    return "UNKNOWN";
+  }
+}
+
+// Mapeamento de reason codes WiFi para texto
+const char* reasonCodeName(int code) {
+  switch (code) {
+    case 0:  return "NONE";
+    case 1:  return "UNSPECIFIED";
+    case 2:  return "AUTH_EXPIRE";
+    case 3:  return "AUTH_LEAVE";
+    case 4:  return "ASSOC_EXPIRE";
+    case 5:  return "ASSOC_TOOMANY";
+    case 6:  return "NOT_AUTHED";
+    case 7:  return "NOT_ASSOCED";
+    case 8:  return "ASSOC_LEAVE";
+    case 9:  return "ASSOC_NOT_AUTHED";
+    case 13: return "INVALID_IE";
+    case 14: return "MIC_FAILURE";
+    case 15: return "4WAY_HANDSHAKE_TIMEOUT";
+    case 16: return "GROUP_KEY_TIMEOUT";
+    case 23: return "8021X_AUTH_FAIL";
+    case 24: return "CIPHER_REJECTED";
+    default: return "CODE_UNKNOWN";
+  }
+}
+
+struct PhaseCounters {
+  unsigned long phase_scan_ok         = 0;
+  unsigned long phase_scan_fail       = 0;
+  unsigned long phase_auth_fail       = 0;
+  unsigned long phase_assoc_fail      = 0;
+  unsigned long phase_handshake_fail  = 0;
+  unsigned long phase_dhcp_fail       = 0;
+  unsigned long phase_connected       = 0;
+  unsigned long phase_mac_set_fail    = 0;
+} phaseStats;
+
+// =============================================
+// TESTES DE CONECTIVIDADE POS-CONEXAO
+// =============================================
+struct ConnTestResult {
+  int ping_ms;       // -1 = nao testado, -2 = timeout, >=0 = latencia em ms
+  bool dns_ok;       // true = resolveu DNS
+  bool http_ok;      // true = HTTP GET funcionou
+};
+
+struct ConnTestStats {
+  unsigned long total_tested;       // quantos MACs conectados foram testados
+  unsigned long ping_ok;
+  unsigned long ping_fail;
+  unsigned long dns_ok;
+  unsigned long dns_fail;
+  unsigned long http_ok;
+  unsigned long http_fail;
+} connStats;
+
+// Funcoes implementadas apos as definicoes de log/reply
+ConnTestResult testarConectividadeReal();
+void registrarConnStats(const ConnTestResult &r);
+
+// =============================================
+// TESTES DE POLITICA DE BLOQUEIO (Timeout + Rate Limiting)
+// =============================================
+#define MAX_TIMEOUT_MACS 5
+#define TIMEOUT_STAGES 4
+
+struct TimeoutTestEntry {
+  uint8_t mac[6];
+  unsigned long blocked_at_ms;       // quando foi confirmado como bloqueado
+  unsigned long next_retest_ms;      // quando re-testar
+  int stage;                         // 0=5min, 1=15min, 2=30min, 3=60min
+  bool done;
+  bool was_blocked[TIMEOUT_STAGES];  // resultado de cada estagio
+};
+
+TimeoutTestEntry timeout_tests[MAX_TIMEOUT_MACS];
+int timeout_test_count = 0;
+bool timeout_test_active = false;
+bool timeout_test_running = false;   // true while actively testing a specific MAC
+int timeout_test_idx = 0;            // which entry is being tested now
+const unsigned long TIMEOUT_MINUTES[TIMEOUT_STAGES] = {5, 15, 30, 60};
+
+// Rate limiting test
+bool ratelimit_test_active = false;
+int ratelimit_phase = 0;             // 0=fast, 1=slow, 2=done
+unsigned long ratelimit_fast_blocked = 0;
+unsigned long ratelimit_fast_total = 0;
+unsigned long ratelimit_slow_blocked = 0;
+unsigned long ratelimit_slow_total = 0;
+unsigned long ratelimit_start_ms = 0;
+#define RATELIMIT_MACS_PER_PHASE 10   // testa 10 MACs em cada fase
+
+void processarTimeoutTests();
+void processarRatelimitTest();
+void iniciarBlacklistPolicyTest();
+void pararBlacklistPolicyTest();
+void iniciarRatelimitTest();
+void pushEvent(const char *type, const char *mac, const char *detail);
+void pollMonitorFrames();
+// =============================================
+// SERVIDOR TCP + MQTT (globals — usadas por TCPMQTT.h)
+// =============================================
+WiFiServer tcpServer(2323);
+WiFiClient tcpClients[3];
+bool tcp_server_active = false;
+bool captive_enabled = true;  // captive portal ativo por padrao
+
+IPAddress mqtt_broker_ip;
+uint16_t mqtt_broker_port = 1883;
+WiFiClient mqttClient;
+unsigned long lastMqttPublish = 0;
+bool mqtt_connected = false;
 
 // =============================================
 // AP MODE - CONNECTED STATIONS TRACKING
@@ -148,10 +344,14 @@ void log(const char *s) {
   Serial.print(s);
   if (SerialBT) SerialBT.print(s);
 }
-void logln(const char *s = "") {
+void logln(const char *s) {
   if (!log_enabled) return;
-  Serial.println(s);
-  if (SerialBT) SerialBT.println(s);
+  if (s) Serial.println(s);
+  else Serial.println();
+  if (SerialBT) {
+    if (s) SerialBT.println(s);
+    else SerialBT.println();
+  }
 }
 void logf(const char *fmt, ...) {
   if (!log_enabled) return;
@@ -164,6 +364,11 @@ void logf(const char *fmt, ...) {
   if (SerialBT) SerialBT.print(buf);
 }
 
+#include <DNSServer.h>
+extern DNSServer dnsServer;
+
+#include "TCPMQTT.h"
+
 // =============================================
 // PROTÓTIPOS
 // =============================================
@@ -173,18 +378,17 @@ void addBlockedMAC(const uint8_t *mac, const char *tipo, bool conectado);
 int buscarRetest(const uint8_t *mac);
 void addRetest(const uint8_t *mac);
 void processarRetestes();
+void piscarLED(int vezes, int intervaloMs);
 
 void setupLittleFS();
-void loadConfig();
-void saveConfig();
 void appendCSV(unsigned long timestampSeg, const String &macStr,
-               const String &tipo, bool conectado, const String &ip);
+               const String &oui, const String &tipo, uint8_t phase,
+               int reasonCode, const String &reasonName, const String &ip,
+               int pingMs = -1, int dnsOk = -1, int httpOk = -1);
 bool setStationMAC(const uint8_t* newMAC);
-void testarMAC(const uint8_t* mac, const String &tipo);
-String macToString(const uint8_t* mac);
+void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome);
 void processCommands();
 void executeCommand(char *cmd);
-bool parseMAC(const char *str, uint8_t mac[6]);
 void cmdSummary();
 void cmdDump();
 void cmdReset();
@@ -205,7 +409,7 @@ void cmdDebugDump();
 // =============================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  delay(1000);  // aguardar USB estabilizar, sem bloquear
 
   SerialBT.setName("PicoTester");
   SerialBT.begin();
@@ -213,6 +417,12 @@ void setup() {
   reply("\n--- Testador de Bloqueio de MAC (24h) ---\n");
   replyf("Rede: %s\n", config_ssid);
   replyf("MAC alvo: %s\n", macToString(config_mac_alvo).c_str());
+  replyf("OUI: %s (%02X:%02X:%02X) %s\n",
+         perfis_oui[oui_ativo].nome,
+         perfis_oui[oui_ativo].prefixo[0],
+         perfis_oui[oui_ativo].prefixo[1],
+         perfis_oui[oui_ativo].prefixo[2],
+         oui_rotativo ? "[ROTATIVO]" : "");
   replyf("Duracao: %lu segundos\n", DURACAO_TESTE_SEG);
   replyf("Intervalo: %lu s\n", INTERVALO_ENTRE_TENTATIVAS_SEG);
   reply("Digite 'help' para comandos\n");
@@ -238,12 +448,17 @@ void setup() {
 void loop() {
   processCommands();
 
-  // AP mode: maintain AP, web dashboard, and poll for connected stations
+  // Processar testes de politica e servicos de rede (background)
+  processarTimeoutTests();
+  processarRatelimitTest();
+  processarTCPServer();
+  processarMQTT();
+  pollMonitorFrames();
+
+  // AP mode: web dashboard now runs on core 1 (loop1)
   if (ap_mode_active) {
     processCommands();
-    handleWebDashboard();
-    updateStationList();
-    delay(100);
+    delay(10);
     return;
   }
 
@@ -262,26 +477,34 @@ void loop() {
        stats.total_cycles, numVariacoes, segDecorridos);
 
   // --- MACs aleatórios ---
+  // Seleciona OUI para este ciclo
+  if (oui_rotativo) {
+    oui_ativo = oui_ciclo_atual % OUI_COUNT;
+    oui_ciclo_atual++;
+  }
+  uint8_t *ouiPrefixo = perfis_oui[oui_ativo].prefixo;
+  String ouiNome = perfis_oui[oui_ativo].nome;
+
   for (int i = 0; i < numVariacoes; i++) {
     if ((millis() - startMillis) / 1000 >= DURACAO_TESTE_SEG) break;
     processCommands();
     if (ap_mode_active) return;
 
     uint8_t macAleatorio[6];
-    macAleatorio[0] = 0xC8;
-    macAleatorio[1] = 0xA6;
-    macAleatorio[2] = 0xEF;
+    macAleatorio[0] = ouiPrefixo[0];
+    macAleatorio[1] = ouiPrefixo[1];
+    macAleatorio[2] = ouiPrefixo[2];
     macAleatorio[3] = random(0, 256);
     macAleatorio[4] = random(0, 256);
     macAleatorio[5] = random(0, 256);
 
-    testarMAC(macAleatorio, "random");
+    testarMAC(macAleatorio, "random", ouiNome);
     for (int w = 0; w < INTERVALO_ENTRE_TENTATIVAS_SEG; w++) {
       processCommands();
       delay(1000);
       if (ap_mode_active || (millis() - startMillis) / 1000 >= DURACAO_TESTE_SEG) return;
     }
-}
+  }
 
   // --- Retestes: re-testar MACs bloqueados para confirmar ---
   if ((millis() - startMillis) / 1000 < DURACAO_TESTE_SEG && retest_count > 0) {
@@ -294,7 +517,8 @@ void loop() {
       processCommands();
       if (ap_mode_active) return;
 
-      testarMAC(retest_queue[i].mac, "retest");
+      String retestOUI = ouiDoMAC(retest_queue[i].mac);
+      testarMAC(retest_queue[i].mac, "retest", retestOUI);
       for (int w = 0; w < INTERVALO_ENTRE_TENTATIVAS_SEG; w++) {
         processCommands();
         delay(1000);
@@ -307,7 +531,7 @@ void loop() {
   if ((millis() - startMillis) / 1000 < DURACAO_TESTE_SEG) {
     processCommands();
     if (ap_mode_active) return;
-    testarMAC(config_mac_alvo, "exact");
+    testarMAC(config_mac_alvo, "exact", "target");
     for (int w = 0; w < INTERVALO_ENTRE_TENTATIVAS_SEG; w++) {
       processCommands();
       delay(1000);
@@ -317,11 +541,12 @@ void loop() {
 }
 
 // =============================================
-// TESTA UM ÚNICO ENDEREÇO MAC
+// TESTA UM ÚNICO ENDEREÇO MAC (com fases)
 // =============================================
-void testarMAC(const uint8_t* mac, const String &tipo) {
+void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome) {
   String macStr = macToString(mac);
-  logf("Testando [%s] %s ... ", tipo.c_str(), macStr.c_str());
+  logf("Testando [%s|%s] %s ... ", tipo.c_str(), ouiNome.c_str(), macStr.c_str());
+  pushEvent("test_start", macStr.c_str(), ouiNome.c_str());
 
   digitalWrite(LED_BUILTIN, HIGH);
   delay(50);
@@ -332,17 +557,25 @@ void testarMAC(const uint8_t* mac, const String &tipo) {
 
   if (!setStationMAC(mac)) {
     logln("FALHA ao definir MAC");
+    pushEvent("blocked", macStr.c_str(), "MAC_SET_FAIL");
     unsigned long nowSeg = (millis() - startMillis) / 1000;
-    appendCSV(nowSeg, macStr, tipo, false, "ERRO_SET_MAC");
-    if (tipo == "random") stats.random_errors++;
+    appendCSV(nowSeg, macStr, ouiNome, tipo, PHASE_MAC_SET_FAIL, -99, "MAC_SET_FAIL", "");
+    phaseStats.phase_mac_set_fail++;
+    if (tipo == "random") { stats.random_errors++; registrarOUIStat(ouiNome, true); }
     else if (tipo == "exact") stats.exact_errors++;
+    piscarLED(1, 150);
     return;
   }
 
+  unsigned long t0 = millis();
   WiFi.begin(config_ssid, config_pass);
 
+  // Aguarda conexao com timeout de 20s, monitorando fases
   int timeout = 20;
-  while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+  bool conectado = false;
+  int linkStatus = 0;
+
+  while (timeout > 0) {
     delay(1000);
     timeout--;
     processCommands();
@@ -350,14 +583,132 @@ void testarMAC(const uint8_t* mac, const String &tipo) {
       WiFi.disconnect(true);
       return;
     }
+
+    // Verificar WiFi.status() E o link status raw
+    // WiFi.status() so retorna WL_CONNECTED quando tem IP,
+    // mas o chip pode estar conectado (JOIN) sem IP ainda
+    if (WiFi.status() == WL_CONNECTED) {
+      conectado = true;
+      break;
+    }
+    int ls = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+    if (ls == CYW43_LINK_JOIN || ls == CYW43_LINK_NOIP || ls == CYW43_LINK_UP) {
+      conectado = true;
+      break;
+    }
   }
 
-  bool conectado = (WiFi.status() == WL_CONNECTED);
-  String ip = conectado ? WiFi.localIP().toString() : "";
+  unsigned long elapsedMs = millis() - t0;
+  uint8_t phase;
+  int reasonCode = 0;
+  String reasonName = "NONE";
+  String ip = "";
 
-  logf("%s (%s)\n", conectado ? "CONECTADO" : "BLOQUEADO", ip.c_str());
+  if (conectado) {
+    // Forcar reinicio do DHCP no netif STA apos troca de MAC
+    for (struct netif *n = netif_list; n != NULL; n = n->next) {
+      if (n->name[0] == 'e') {
+        dhcp_start(n);
+        break;
+      }
+    }
 
-  // Atualiza estatísticas e fila de bloqueio
+    // Conexao WiFi estabelecida. Verificar DHCP (IP)
+    unsigned long tDhcp0 = millis();
+    bool temIP = false;
+    while (millis() - tDhcp0 < 15000) {
+      processCommands();
+      if (ap_mode_active) { WiFi.disconnect(true); return; }
+      IPAddress lip = WiFi.localIP();
+      if (lip[0] != 0 || lip[1] != 0 || lip[2] != 0 || lip[3] != 0) {
+        temIP = true;
+        ip = lip.toString();
+        break;
+      }
+      delay(500);
+    }
+
+    if (temIP) {
+      phase = PHASE_CONNECTED;
+      reasonCode = 0;
+      reasonName = "OK";
+      phaseStats.phase_connected++;
+    } else {
+      phase = PHASE_DHCP_FAIL;
+      reasonCode = CYW43_LINK_NOIP;
+      reasonName = "DHCP_TIMEOUT";
+      phaseStats.phase_dhcp_fail++;
+      ip = "(sem DHCP)";
+    }
+  } else {
+    // Conexao falhou. Usar cyw43_wifi_link_status para determinar a fase
+    linkStatus = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+
+    if (linkStatus == CYW43_LINK_BADAUTH) {
+      phase = PHASE_AUTH_FAIL;
+      reasonCode = linkStatus;
+      reasonName = "BADAUTH";
+      phaseStats.phase_auth_fail++;
+    } else if (linkStatus == CYW43_LINK_NONET) {
+      phase = PHASE_SCAN_FAIL;
+      reasonCode = linkStatus;
+      reasonName = "SSID_NOT_FOUND";
+      phaseStats.phase_scan_fail++;
+    } else if (linkStatus == CYW43_LINK_FAIL) {
+      phase = PHASE_HANDSHAKE_FAIL;
+      reasonCode = linkStatus;
+      reasonName = "HANDSHAKE_OR_ASSOC_FAIL";
+      phaseStats.phase_handshake_fail++;
+    } else if (linkStatus == CYW43_LINK_DOWN) {
+      phase = PHASE_ASSOC_FAIL;
+      reasonCode = linkStatus;
+      reasonName = "LINK_DOWN";
+      phaseStats.phase_assoc_fail++;
+    } else {
+      // JOIN, NOIP ou outro estado inesperado
+      phase = PHASE_ASSOC_FAIL;
+      reasonCode = linkStatus;
+      if (linkStatus == CYW43_LINK_JOIN) reasonName = "JOIN_NOIP";
+      else if (linkStatus == CYW43_LINK_NOIP) reasonName = "NOIP";
+      else if (linkStatus == CYW43_LINK_UP) reasonName = "UP_UNEXPECTED";
+      else reasonName = "UNKNOWN";
+      phaseStats.phase_assoc_fail++;
+    }
+  }
+
+  // Testes de conectividade real (ping/DNS/HTTP) apenas com IP valido
+  int connPingMs = -1, connDnsOk = -1, connHttpOk = -1;
+  if (phase == PHASE_CONNECTED && ip.length() > 0 && ip != "(sem DHCP)") {
+    ConnTestResult cr = testarConectividadeReal();
+    connPingMs = cr.ping_ms;
+    connDnsOk = cr.dns_ok ? 1 : 0;
+    connHttpOk = cr.http_ok ? 1 : 0;
+    registrarConnStats(cr);
+  }
+
+  // LED feedback: numero de piscadas = fase
+  // 2 = scan fail, 3 = auth fail, 4 = assoc fail, 5 = handshake fail, 6 = dhcp fail, 7 = connected
+  int ledPulses = phase;  // PHASE_SCAN_FAIL=2, AUTH=3, ASSOC=4, HANDSHAKE=5, DHCP=6, CONNECTED=7
+  piscarLED(ledPulses, 120);
+
+  // Emitir evento live
+  {
+    char detail[64];
+    snprintf(detail, sizeof(detail), "%s rc=%d %s",
+             phaseName(phase), reasonCode, reasonName.c_str());
+    if (conectado) {
+      pushEvent("result", macStr.c_str(), detail);
+    } else {
+      pushEvent("blocked", macStr.c_str(), detail);
+    }
+  }
+
+  logf("%s [fase=%s, rc=%d/%s, %lums] (%s)\n",
+       conectado ? "CONECTADO" : "BLOQUEADO",
+       phaseName(phase), reasonCode, reasonName.c_str(),
+       elapsedMs, ip.c_str());
+
+  // Atualiza estatisticas e fila de bloqueio
   if (tipo == "random") {
     if (conectado) stats.random_connected++;
     else stats.random_blocked++;
@@ -366,14 +717,424 @@ void testarMAC(const uint8_t* mac, const String &tipo) {
     else stats.exact_blocked++;
   }
 
-  // Gerencia lista de bloqueados e retestes
+  // Gerencia lista de bloqueados e retestes + OUI stats
   addBlockedMAC(mac, tipo.c_str(), conectado);
+  if (tipo == "random" || tipo == "retest") {
+    registrarOUIStat(ouiNome, !conectado);
+  }
 
   unsigned long nowSeg = (millis() - startMillis) / 1000;
-  appendCSV(nowSeg, macStr, tipo, conectado, ip);
+  appendCSV(nowSeg, macStr, ouiNome, tipo, phase, reasonCode, reasonName, ip,
+            connPingMs, connDnsOk, connHttpOk);
 
   WiFi.disconnect(true);
   delay(200);
+}
+
+// Pisca o LED n vezes com intervalo definido
+void piscarLED(int vezes, int intervaloMs) {
+  if (vezes <= 0) return;
+  for (int i = 0; i < vezes; i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(intervaloMs);
+    digitalWrite(LED_BUILTIN, LOW);
+    if (i < vezes - 1) delay(intervaloMs);
+  }
+}
+
+// =============================================
+// TESTES DE CONECTIVIDADE REAL (implementacao)
+// =============================================
+ConnTestResult testarConectividadeReal() {
+  ConnTestResult r;
+  r.ping_ms = -1;
+  r.dns_ok = false;
+  r.http_ok = false;
+
+  IPAddress gw = WiFi.gatewayIP();
+
+  // 1. Ping ao gateway
+  if (gw[0] != 0 || gw[1] != 0 || gw[2] != 0 || gw[3] != 0) {
+    int ret = WiFi.ping(gw, 3);
+    if (ret >= 0) {
+      r.ping_ms = ret;
+      if (log_enabled) { replyf("  [PING] gateway %s: %d ms\n", gw.toString().c_str(), ret); }
+    } else {
+      r.ping_ms = -2;
+      if (log_enabled) { replyf("  [PING] gateway %s: TIMEOUT\n", gw.toString().c_str()); }
+    }
+  } else {
+    r.ping_ms = -3;
+  }
+
+  // 2. Resolucao DNS
+  IPAddress resolved;
+  if (WiFi.hostByName("neverssl.com", resolved)) {
+    r.dns_ok = true;
+    if (log_enabled) { replyf("  [DNS] neverssl.com -> %s OK\n", resolved.toString().c_str()); }
+  } else {
+    if (log_enabled) { reply("  [DNS] neverssl.com: FALHA\n"); }
+  }
+
+  // 3. HTTP GET
+  WiFiClient client;
+  client.setTimeout(5);
+  if (client.connect("neverssl.com", 80)) {
+    client.print("GET / HTTP/1.0\r\nHost: neverssl.com\r\nConnection: close\r\n\r\n");
+    unsigned long t0 = millis();
+    bool gotResponse = false;
+    while (millis() - t0 < 5000) {
+      if (client.available()) {
+        String line = client.readStringUntil('\n');
+        if (line.startsWith("HTTP/")) {
+          r.http_ok = true;
+          if (log_enabled) { replyf("  [HTTP] neverssl.com: %s", line.c_str()); }
+          break;
+        }
+        gotResponse = true;
+      }
+      if (!client.connected() && gotResponse) break;
+      delay(10);
+    }
+    if (!r.http_ok && log_enabled) { reply("  [HTTP] neverssl.com: sem resposta HTTP\n"); }
+    client.stop();
+  } else {
+    if (log_enabled) { reply("  [HTTP] neverssl.com: FALHA ao conectar\n"); }
+  }
+
+  // Emitir evento de conectividade
+  {
+    char detail[64];
+    snprintf(detail, sizeof(detail), "ping=%d dns=%d http=%d", r.ping_ms, r.dns_ok, r.http_ok);
+    pushEvent("conn_test", "", detail);
+  }
+
+  return r;
+}
+
+void registrarConnStats(const ConnTestResult &r) {
+  connStats.total_tested++;
+  if (r.ping_ms >= 0) connStats.ping_ok++;
+  else if (r.ping_ms == -2 || r.ping_ms == -3) connStats.ping_fail++;
+  if (r.dns_ok) connStats.dns_ok++; else connStats.dns_fail++;
+  if (r.http_ok) connStats.http_ok++; else connStats.http_fail++;
+}
+
+// =============================================
+// TESTES DE POLITICA DE BLOQUEIO (implementacao)
+// =============================================
+
+void iniciarBlacklistPolicyTest() {
+  if (timeout_test_active) {
+    reply("Teste de politica ja esta em andamento.\n");
+    reply("Use 'blacklist-policy stop' para parar.\n");
+    return;
+  }
+
+  reply("\n=== TESTE DE POLITICA DE BLACKLIST ===\n");
+  reply("Serao gerados 3 MACs aleatorios, testados ate serem\n");
+  reply("confirmados como bloqueados, e depois re-testados apos:\n");
+  reply("  5 min, 15 min, 30 min, 60 min\n\n");
+  reply("O teste inicia agora. Aguarde os MACs serem bloqueados...\n");
+
+  timeout_test_count = 0;
+  timeout_test_active = true;
+  timeout_test_running = false;
+  timeout_test_idx = 0;
+
+  // Gera 3 MACs com o OUI ativo
+  for (int i = 0; i < 3; i++) {
+    memcpy(timeout_tests[i].mac, perfis_oui[oui_ativo].prefixo, 3);
+    timeout_tests[i].mac[3] = random(0, 256);
+    timeout_tests[i].mac[4] = random(0, 256);
+    timeout_tests[i].mac[5] = random(0, 256);
+    timeout_tests[i].blocked_at_ms = 0;
+    timeout_tests[i].next_retest_ms = 0;
+    timeout_tests[i].stage = 0;
+    timeout_tests[i].done = false;
+    memset(timeout_tests[i].was_blocked, 0, sizeof(timeout_tests[i].was_blocked));
+    timeout_test_count++;
+    replyf("  MAC #%d: %s\n", i + 1, macToString(timeout_tests[i].mac).c_str());
+  }
+}
+
+void pararBlacklistPolicyTest() {
+  if (!timeout_test_active) {
+    reply("Nenhum teste de politica ativo.\n");
+    return;
+  }
+  timeout_test_active = false;
+  timeout_test_running = false;
+  reply("Teste de politica de blacklist interrompido.\n");
+}
+
+// Encontra o indice de um MAC nos timeout_tests
+int findTimeoutTestMAC(const uint8_t *mac) {
+  for (int i = 0; i < timeout_test_count; i++) {
+    if (macIgual(timeout_tests[i].mac, mac)) return i;
+  }
+  return -1;
+}
+
+// Chamada apos cada testarMAC quando o teste de politica esta ativo
+void processarTimeoutTests() {
+  if (!timeout_test_active) return;
+
+  unsigned long now = millis();
+
+  // Fase 1: Verificar se os MACs iniciais ja foram confirmados como bloqueados
+  if (!timeout_test_running) {
+    for (int i = 0; i < timeout_test_count; i++) {
+      if (timeout_tests[i].blocked_at_ms > 0) continue; // ja foi bloqueado
+
+      int bi = buscarBlockedMAC(timeout_tests[i].mac);
+      if (bi >= 0 && blocked_macs[bi].confirmado) {
+        // MAC confirmado como bloqueado! Registrar timestamp
+        timeout_tests[i].blocked_at_ms = now;
+        timeout_tests[i].stage = 0;
+        timeout_tests[i].next_retest_ms = now + TIMEOUT_MINUTES[0] * 60000UL;
+        replyf("\n[POLICY] MAC %s confirmado bloqueado. Reteste em %lu min.\n",
+               macToString(timeout_tests[i].mac).c_str(), TIMEOUT_MINUTES[0]);
+      }
+    }
+
+    // Verificar se todos ja foram bloqueados ou se expirou o tempo maximo (5 ciclos)
+    bool allBlocked = true;
+    for (int i = 0; i < timeout_test_count; i++) {
+      if (timeout_tests[i].blocked_at_ms == 0) allBlocked = false;
+    }
+    if (!allBlocked && stats.total_cycles < 10) return; // continua esperando
+    if (!allBlocked) {
+      reply("[POLICY] Nem todos os MACs foram bloqueados apos 10 ciclos.\n");
+      reply("Continuando apenas com os que foram confirmados.\n");
+    }
+
+    // Iniciar fase de retestes
+    timeout_test_running = true;
+    timeout_test_idx = 0;
+    reply("\n[POLICY] Iniciando fase de retestes periodicos...\n");
+  }
+
+  // Fase 2: Verificar se algum MAC precisa ser re-testado agora
+  if (timeout_test_running && !ap_mode_active) {
+    for (int i = 0; i < timeout_test_count; i++) {
+      if (timeout_tests[i].done) continue;
+      if (timeout_tests[i].blocked_at_ms == 0) continue;
+      if (now < timeout_tests[i].next_retest_ms) continue;
+
+      timeout_test_idx = i;
+      String ouiNome = ouiDoMAC(timeout_tests[i].mac);
+
+      replyf("\n[POLICY] Retestando MAC %s (estagio %d: %lu min)...\n",
+             macToString(timeout_tests[i].mac).c_str(),
+             timeout_tests[i].stage + 1,
+             TIMEOUT_MINUTES[timeout_tests[i].stage]);
+
+      testarMAC(timeout_tests[i].mac, "policy", ouiNome);
+
+      // Verificar resultado: olhar se o MAC continua na lista de bloqueados
+      int bi = buscarBlockedMAC(timeout_tests[i].mac);
+      bool stillBlocked = (bi >= 0);
+
+      timeout_tests[i].was_blocked[timeout_tests[i].stage] = stillBlocked;
+
+      if (stillBlocked) {
+        replyf("  -> AINDA BLOQUEADO apos %lu min\n",
+               TIMEOUT_MINUTES[timeout_tests[i].stage]);
+      } else {
+        replyf("  -> DESBLOQUEADO apos %lu min! Bloqueio temporario confirmado!\n",
+               TIMEOUT_MINUTES[timeout_tests[i].stage]);
+      }
+
+      // Avancar para o proximo estagio
+      timeout_tests[i].stage++;
+      if (timeout_tests[i].stage >= TIMEOUT_STAGES) {
+        timeout_tests[i].done = true;
+        replyf("[POLICY] MAC %s completou todos os estagios.\n",
+               macToString(timeout_tests[i].mac).c_str());
+      } else {
+        timeout_tests[i].next_retest_ms = now + TIMEOUT_MINUTES[timeout_tests[i].stage] * 60000UL;
+        replyf("[POLICY] Proximo reteste em %lu min.\n",
+               TIMEOUT_MINUTES[timeout_tests[i].stage]);
+      }
+
+      break; // testa apenas um MAC por ciclo para nao atrasar o loop
+    }
+
+    // Verificar se todos terminaram
+    bool allDone = true;
+    for (int i = 0; i < timeout_test_count; i++) {
+      if (!timeout_tests[i].done && timeout_tests[i].blocked_at_ms > 0) allDone = false;
+    }
+    if (allDone && timeout_test_running) {
+      reply("\n=== RESULTADO FINAL: POLITICA DE BLACKLIST ===\n");
+      for (int i = 0; i < timeout_test_count; i++) {
+        if (timeout_tests[i].blocked_at_ms == 0) {
+          replyf("  %s: nao foi bloqueado (nao elegivel)\n",
+                 macToString(timeout_tests[i].mac).c_str());
+          continue;
+        }
+        replyf("  %s:\n", macToString(timeout_tests[i].mac).c_str());
+        for (int s = 0; s < TIMEOUT_STAGES; s++) {
+          if (timeout_tests[i].was_blocked[s]) {
+            replyf("    %lu min: BLOQUEADO\n", TIMEOUT_MINUTES[s]);
+          } else {
+            replyf("    %lu min: DESBLOQUEADO <- timeout maximo\n", TIMEOUT_MINUTES[s]);
+            break;
+          }
+          if (s == TIMEOUT_STAGES - 1) {
+            reply("    -> Bloqueio PERMANENTE (resistiu a 60 min)\n");
+          }
+        }
+      }
+      reply("=============================================\n\n");
+      timeout_test_active = false;
+      timeout_test_running = false;
+
+      // Salvar em CSV
+      File f = LittleFS.open("/policy_test.csv", "a");
+      if (f) {
+        f.println("mac,5min,15min,30min,60min,tipo");
+        for (int i = 0; i < timeout_test_count; i++) {
+          if (timeout_tests[i].blocked_at_ms == 0) continue;
+          f.printf("%s,%d,%d,%d,%d,timeout\n",
+                   macToString(timeout_tests[i].mac).c_str(),
+                   timeout_tests[i].was_blocked[0],
+                   timeout_tests[i].was_blocked[1],
+                   timeout_tests[i].was_blocked[2],
+                   timeout_tests[i].was_blocked[3]);
+        }
+        f.close();
+        reply("Resultados salvos em /policy_test.csv\n");
+      }
+    }
+  }
+}
+
+// Rate Limiting Test
+void iniciarRatelimitTest() {
+  if (ratelimit_test_active) {
+    reply("Teste de rate limiting ja esta em andamento.\n");
+    return;
+  }
+  if (timeout_test_active) {
+    reply("Termine o teste de blacklist-policy primeiro.\n");
+    return;
+  }
+
+  reply("\n=== TESTE DE RATE LIMITING ===\n");
+  replyf("Fase 1: %d MACs com intervalo de 2s (rajada)\n", RATELIMIT_MACS_PER_PHASE);
+  replyf("Fase 2: %d MACs com intervalo de 30s (espacado)\n", RATELIMIT_MACS_PER_PHASE);
+  reply("O teste usara o OUI ativo e rodara entre os ciclos normais.\n\n");
+
+  ratelimit_test_active = true;
+  ratelimit_phase = 0;
+  ratelimit_fast_blocked = 0;
+  ratelimit_fast_total = 0;
+  ratelimit_slow_blocked = 0;
+  ratelimit_slow_total = 0;
+  ratelimit_start_ms = millis();
+}
+
+void processarRatelimitTest() {
+  if (!ratelimit_test_active) return;
+  if (ap_mode_active) return;
+
+  unsigned long totalTestadas = ratelimit_fast_total + ratelimit_slow_total;
+
+  // Fase 0: rajada (fast)
+  if (ratelimit_phase == 0) {
+    if (ratelimit_fast_total >= RATELIMIT_MACS_PER_PHASE) {
+      ratelimit_phase = 1;
+      replyf("\n[RATELIMIT] Fase 1 concluida: %lu/%lu bloqueados (%.0f%%)\n",
+             ratelimit_fast_blocked, ratelimit_fast_total,
+             ratelimit_fast_total > 0 ? 100.0 * ratelimit_fast_blocked / ratelimit_fast_total : 0);
+      reply("Iniciando Fase 2 (intervalo de 30s)...\n");
+      return;
+    }
+
+    // Gera e testa um MAC com intervalo curto
+    uint8_t mac[6];
+    memcpy(mac, perfis_oui[oui_ativo].prefixo, 3);
+    mac[3] = random(0, 256);
+    mac[4] = random(0, 256);
+    mac[5] = random(0, 256);
+
+    replyf("[RATELIMIT-FAST] #%lu: %s\n", ratelimit_fast_total + 1, macToString(mac).c_str());
+    testarMAC(mac, "ratelimit", ouiNomeAtivo());
+
+    ratelimit_fast_total++;
+    if (buscarBlockedMAC(mac) >= 0) ratelimit_fast_blocked++;
+
+    // Intervalo curto (2s)
+    for (int w = 0; w < 2; w++) {
+      delay(1000);
+      processCommands();
+      if (ap_mode_active) return;
+    }
+    return;
+  }
+
+  // Fase 1: espacado (slow)
+  if (ratelimit_phase == 1) {
+    if (ratelimit_slow_total >= RATELIMIT_MACS_PER_PHASE) {
+      ratelimit_phase = 2;
+      replyf("\n[RATELIMIT] Fase 2 concluida: %lu/%lu bloqueados (%.0f%%)\n",
+             ratelimit_slow_blocked, ratelimit_slow_total,
+             ratelimit_slow_total > 0 ? 100.0 * ratelimit_slow_blocked / ratelimit_slow_total : 0);
+
+      // Analise final
+      float taxaFast = ratelimit_fast_total > 0 ? 100.0 * ratelimit_fast_blocked / ratelimit_fast_total : 0;
+      float taxaSlow = ratelimit_slow_total > 0 ? 100.0 * ratelimit_slow_blocked / ratelimit_slow_total : 0;
+
+      reply("\n=== RESULTADO: RATE LIMITING ===\n");
+      replyf("Rajada (2s):   %.0f%% bloqueados (%lu/%lu)\n",
+             taxaFast, ratelimit_fast_blocked, ratelimit_fast_total);
+      replyf("Espacado (30s): %.0f%% bloqueados (%lu/%lu)\n",
+             taxaSlow, ratelimit_slow_blocked, ratelimit_slow_total);
+
+      if (taxaFast > taxaSlow * 1.5) {
+        reply("DIAGNOSTICO: Rate limiting DETECTADO!\n");
+        reply("O AP bloqueia mais MACs quando as tentativas sao rapidas.\n");
+        reply("Intervalo seguro sugerido: >= 30s entre tentativas.\n");
+      } else {
+        reply("DIAGNOSTICO: Rate limiting NAO detectado.\n");
+        reply("As taxas de bloqueio sao similares independente do intervalo.\n");
+      }
+      reply("==================================\n\n");
+
+      // Salvar em CSV
+      File f = LittleFS.open("/policy_test.csv", "a");
+      if (f) {
+        f.println("phase,macs_tested,macs_blocked,rate_pct");
+        f.printf("fast,%lu,%lu,%.1f\n", ratelimit_fast_total, ratelimit_fast_blocked, taxaFast);
+        f.printf("slow,%lu,%lu,%.1f\n", ratelimit_slow_total, ratelimit_slow_blocked, taxaSlow);
+        f.close();
+        reply("Resultados salvos em /policy_test.csv\n");
+      }
+
+      ratelimit_test_active = false;
+      return;
+    }
+
+    // Aguardar 30s entre tentativas (fora do loop principal de teste)
+    // Usamos um contador de segundos acumulado
+    static unsigned long lastSlowTest = 0;
+    if (millis() - lastSlowTest < 30000) return;
+    lastSlowTest = millis();
+
+    uint8_t mac[6];
+    memcpy(mac, perfis_oui[oui_ativo].prefixo, 3);
+    mac[3] = random(0, 256);
+    mac[4] = random(0, 256);
+    mac[5] = random(0, 256);
+
+    replyf("[RATELIMIT-SLOW] #%lu: %s\n", ratelimit_slow_total + 1, macToString(mac).c_str());
+    testarMAC(mac, "ratelimit", ouiNomeAtivo());
+
+    ratelimit_slow_total++;
+    if (buscarBlockedMAC(mac) >= 0) ratelimit_slow_blocked++;
+  }
 }
 
 // =============================================
@@ -514,7 +1275,7 @@ void startAPMode() {
   // Apply custom IP configuration
   WiFi.softAPConfig(ap_config_ip, ap_config_gateway, ap_config_subnet);
 
-  if (WiFi.softAP(config_ap_ssid, config_pass)) {
+  if (WiFi.softAP(config_ap_ssid, config_ap_pass)) {
     ap_mode_active = true;
     connected_station_count = 0;
     memset(connected_stations, 0, sizeof(connected_stations));
@@ -663,6 +1424,15 @@ bool setStationMAC(const uint8_t* newMAC) {
   memcpy(buf + varlen, newMAC, 6);
 
   int ret = cyw43_ioctl(&cyw43_state, CYW43_IOCTL_SET_VAR, varlen + 6, buf, CYW43_ITF_STA);
+
+  // Atualizar tambem o netif STA (w0) para DHCP/ARP usarem o novo MAC
+  for (struct netif *n = netif_list; n != NULL; n = n->next) {
+    if (n->name[0] == 'w' && n->name[1] == '0') {
+      memcpy(n->hwaddr, newMAC, 6);
+      break;
+    }
+  }
+
   return (ret == 0);
 }
 
@@ -681,8 +1451,115 @@ bool setAPMAC(const uint8_t *newMAC) {
 }
 
 // =============================================
-// LITTLEFS
+// MONITOR MODE EXPERIMENTAL
 // =============================================
+bool monitor_mode_active = false;
+
+bool setMonitorMode(bool enable) {
+  extern cyw43_t cyw43_state;
+
+  // WLC_SET_MONITOR = 108
+  // Envia como SET_VAR com o comando nos primeiros 4 bytes e valor nos 4 seguintes
+  uint8_t buf[8];
+  uint32_t cmd = 108;  // WLC_SET_MONITOR
+  uint32_t val = enable ? 1 : 0;
+  memcpy(buf, &cmd, 4);
+  memcpy(buf + 4, &val, 4);
+
+  int ret = cyw43_ioctl(&cyw43_state, CYW43_IOCTL_SET_VAR, 8, buf, CYW43_ITF_STA);
+  if (ret == 0) {
+    replyf("[MONITOR] Modo monitor %s via IOCTL.\n", enable ? "ATIVADO" : "desativado");
+    monitor_mode_active = enable;
+  } else {
+    replyf("[MONITOR] Falha ao %s modo monitor (ret=%d).\n",
+           enable ? "ativar" : "desativar", ret);
+  }
+  return (ret == 0);
+}
+
+// Tenta capturar frames raw em modo monitor (experimental)
+void pollMonitorFrames() {
+  if (!monitor_mode_active) return;
+
+  // Tentar ler dados diretamente do buffer da interface
+  // Em modo monitor, o chip pode entregar frames 802.11 raw
+  // Usamos a callback de ethernet para verificar
+
+  // O CYW43 entrega frames via cyw43_cb_process_ethernet -> lwIP
+  // Em modo monitor, os frames 802.11 podem ser descartados pelo driver
+  // como "nao-ethernet". Tentamos verificar se ha dados pendentes.
+
+  // Por enquanto, apenas verificamos periodicamente se o modo
+  // continua ativo e reportamos
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 10000) return;
+  lastCheck = millis();
+
+  // Verifica se ainda estamos em modo monitor
+  int linkStatus = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+  logf("[MONITOR] Status: link=%d, monitor=%s\n",
+       linkStatus, monitor_mode_active ? "ON" : "OFF");
+}
+
+void startMonitorMode() {
+  reply("\n=== MODO MONITOR EXPERIMENTAL ===\n");
+  reply("Tentando ativar WLC_SET_MONITOR (IOCTL 108)...\n");
+  reply("Este recurso e experimental e depende do firmware CYW43439.\n\n");
+
+  WiFi.disconnect(true);
+  delay(500);
+
+  if (setMonitorMode(true)) {
+    reply("Modo monitor ativado com sucesso!\n");
+    reply("O chip CYW43439 agora opera em modo promiscuo.\n");
+    reply("Nota: A captura de frames raw 802.11 depende do suporte\n");
+    reply("do driver. O firmware pode nao entregar frames ao host.\n\n");
+
+    reply("Use 'monitor off' para desativar.\n");
+    reply("Use 'monitor status' para verificar o estado.\n");
+
+    // Criar CSV para captura
+    if (!LittleFS.exists("/monitor.csv")) {
+      File f = LittleFS.open("/monitor.csv", "w");
+      if (f) {
+        f.println("timestamp_ms,frame_type,src_mac,dst_mac,rssi,channel,data_len");
+        f.close();
+      }
+    }
+  } else {
+    reply("FALHA ao ativar modo monitor.\n");
+    reply("Possiveis causas:\n");
+    reply("  - Firmware CYW43439 nao suporta WLC_SET_MONITOR\n");
+    reply("  - Driver nao implementa o IOCTL necessario\n");
+    reply("  - Hardware precisa de configuracao adicional\n");
+  }
+}
+
+void stopMonitorMode() {
+  if (!monitor_mode_active) {
+    reply("Modo monitor nao esta ativo.\n");
+    return;
+  }
+
+  setMonitorMode(false);
+  monitor_mode_active = false;
+
+  reply("Modo monitor desativado. Voltando ao modo normal...\n");
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  reply("Pronto.\n");
+}
+
+void cmdMonitorStatus() {
+  extern cyw43_t cyw43_state;
+  int linkStatus = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+
+  replyf("=== STATUS DO MODO MONITOR ===\n");
+  replyf("Ativo: %s\n", monitor_mode_active ? "SIM" : "NAO");
+  replyf("Link status: %d\n", linkStatus);
+  replyf("WiFi mode: %d\n", WiFi.getMode());
+  replyf("================================\n");
+}
 void setupLittleFS() {
   if (!LittleFS.begin()) {
     reply("Erro ao montar LittleFS! Verifique particao.\n");
@@ -693,7 +1570,7 @@ void setupLittleFS() {
   if (!LittleFS.exists(CSV_FILENAME)) {
     File f = LittleFS.open(CSV_FILENAME, "w");
     if (f) {
-      f.println("timestamp_s,mac_address,type,result,ip");
+      f.println("timestamp_s,mac_address,oui,type,result,phase,reason_code,reason_name,ip,ping_ms,dns_ok,http_ok");
       f.close();
       reply("Arquivo CSV criado com cabecalho.\n");
     } else {
@@ -703,15 +1580,19 @@ void setupLittleFS() {
 }
 
 void appendCSV(unsigned long timestampSeg, const String &macStr,
-               const String &tipo, bool conectado, const String &ip) {
+               const String &oui, const String &tipo, uint8_t phase,
+               int reasonCode, const String &reasonName, const String &ip,
+               int pingMs, int dnsOk, int httpOk) {
   File f = LittleFS.open(CSV_FILENAME, "a");
   if (!f) {
     reply("ERRO: nao foi possivel abrir o CSV para escrita!\n");
     return;
   }
-  f.printf("%lu,%s,%s,%s,%s\n",
-           timestampSeg, macStr.c_str(), tipo.c_str(),
-           conectado ? "connected" : "blocked", ip.c_str());
+  f.printf("%lu,%s,%s,%s,%s,%s,%d,%s,%s,%d,%d,%d\n",
+           timestampSeg, macStr.c_str(), oui.c_str(), tipo.c_str(),
+           (phase == PHASE_CONNECTED) ? "connected" : "blocked",
+           phaseName(phase), reasonCode, reasonName.c_str(), ip.c_str(),
+           pingMs, dnsOk, httpOk);
   f.close();
 }
 
@@ -757,11 +1638,15 @@ void executeCommand(char *cmd) {
     reply("  summary               Resumo completo do teste\n");
     reply("  dump                  Exporta o relatorio CSV gravado\n");
     reply("  reset                 Reseta estatisticas e contadores\n");
+    reply("  clearlog              Apaga arquivos de log do LittleFS\n");
     reply("  ssid <nome>           Altera SSID da rede\n");
     reply("  pass <senha>          Altera senha da rede\n");
     reply("  target XX:XX:XX:XX:XX:XX  Altera MAC alvo\n");
     reply("  log on                Ativa logs detalhados\n");
     reply("  log off               Desativa logs (erros e summary aparecem)\n");
+    reply("  oui list              Lista perfis OUI disponiveis\n");
+    reply("  oui <perfil>          Seleciona perfil OUI (ex: oui Apple)\n");
+    reply("  oui all               Modo rotativo: alterna entre todos os OUIs\n");
     reply("  ap on                 Ativa modo AP (Pico vira roteador)\n");
     reply("  ap off                Desativa modo AP e volta ao teste\n");
     reply("  ap status             Mostra status do AP\n");
@@ -770,7 +1655,15 @@ void executeCommand(char *cmd) {
     reply("  ap mac [XX:XX:XX:XX:XX:XX]    Configura MAC do AP\n");
     reply("  ap mac default        Restaura MAC padrao do hardware\n");
     reply("  ap ssid <nome>        Altera SSID do AP (separado do STA)\n");
+    reply("  ap pass <senha>       Altera senha do AP (separada do STA)\n");
     reply("  stations              Lista dispositivos conectados ao AP\n");
+    reply("  captive on/off        Ativa/desativa captive portal no AP\n");
+    reply("  tcp on/off            Servidor TCP na porta 2323 (controle remoto)\n");
+    reply("  mqtt <ip> [porta]     Configura broker MQTT para publicacao\n");
+    reply("  mqtt off              Desativa publicacao MQTT\n");
+    reply("  monitor on/off/status Modo monitor experimental (WLC_SET_MONITOR)\n");
+    reply("  blacklist-policy      Testa politica de blacklist (timeout)\n");
+    reply("  ratelimit-test        Testa se ha rate limiting na rede\n");
     reply("  debug                 Modo AP Debug (captura fingerprint de dispositivos)\n");
     reply("  debugdump             Exibe dados capturados no AP Debug\n");
 
@@ -782,6 +1675,31 @@ void executeCommand(char *cmd) {
 
   } else if (strcmp(cmd, "reset") == 0) {
     cmdReset();
+
+  } else if (strcmp(cmd, "clearlog") == 0) {
+    reply("Apagando arquivos de log...\n");
+    if (LittleFS.exists(CSV_FILENAME)) {
+      LittleFS.remove(CSV_FILENAME);
+      replyf("  %s removido\n", CSV_FILENAME);
+    }
+    if (LittleFS.exists("/ap_debug.csv")) {
+      LittleFS.remove("/ap_debug.csv");
+      reply("  /ap_debug.csv removido\n");
+    }
+    if (LittleFS.exists("/policy_test.csv")) {
+      LittleFS.remove("/policy_test.csv");
+      reply("  /policy_test.csv removido\n");
+    }
+    // Recriar CSV principal com cabecalho
+    File f = LittleFS.open(CSV_FILENAME, "w");
+    if (f) {
+      f.println("timestamp_s,mac_address,oui,type,result,phase,reason_code,reason_name,ip,ping_ms,dns_ok,http_ok");
+      f.close();
+      reply("  Novo arquivo de log criado.\n");
+    }
+    // Resetar tambem as estatisticas
+    cmdReset();
+    reply("Logs apagados e estatisticas resetadas.\n");
 
   } else if (strncmp(cmd, "ssid ", 5) == 0) {
     const char *val = cmd + 5;
@@ -824,6 +1742,46 @@ void executeCommand(char *cmd) {
   } else if (strcmp(cmd, "log off") == 0) {
     log_enabled = false;
     reply("Logs desativados.\n");
+
+  } else if (strncmp(cmd, "oui", 3) == 0) {
+    const char *val = cmd + 3;
+    while (*val == ' ') val++;
+    if (*val == '\0' || strcmp(val, "list") == 0) {
+      replyf("\n--- Perfis OUI (%d disponiveis) ---\n", OUI_COUNT);
+      for (int i = 0; i < OUI_COUNT; i++) {
+        char prefix[18];
+        snprintf(prefix, sizeof(prefix), "%02X:%02X:%02X",
+                 perfis_oui[i].prefixo[0], perfis_oui[i].prefixo[1], perfis_oui[i].prefixo[2]);
+        replyf("  %-12s  %s%s\n",
+               perfis_oui[i].nome, prefix,
+               (i == oui_ativo && !oui_rotativo) ? "  [ATIVO]" : "");
+      }
+      replyf("\nModo: %s\n", oui_rotativo ? "ROTATIVO (todos)" : "FIXO");
+      replyf("Perfil ativo: %s\n", perfis_oui[oui_ativo].nome);
+      reply("Use 'oui <nome>' para selecionar ou 'oui all' para modo rotativo.\n");
+    } else if (strcmp(val, "all") == 0) {
+      oui_rotativo = true;
+      oui_ciclo_atual = 0;
+      reply("Modo OUI rotativo ativado. Cada ciclo usara um perfil diferente.\n");
+    } else {
+      // Buscar perfil por nome
+      bool found = false;
+      for (int i = 0; i < OUI_COUNT; i++) {
+        if (strcasecmp(val, perfis_oui[i].nome) == 0) {
+          oui_ativo = i;
+          oui_rotativo = false;
+          char prefix[18];
+          snprintf(prefix, sizeof(prefix), "%02X:%02X:%02X",
+                   perfis_oui[i].prefixo[0], perfis_oui[i].prefixo[1], perfis_oui[i].prefixo[2]);
+          replyf("Perfil OUI alterado para: %s (%s)\n", perfis_oui[i].nome, prefix);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        replyf("Perfil '%s' nao encontrado. Use 'oui list' para ver os disponiveis.\n", val);
+      }
+    }
 
   } else if (strcmp(cmd, "stations") == 0) {
     cmdStations();
@@ -940,10 +1898,117 @@ void executeCommand(char *cmd) {
         saveConfig();
       }
 
+    } else if (strncmp(val, "pass", 4) == 0) {
+      const char *passstr = val + 4;
+      while (*passstr == ' ') passstr++;
+      if (*passstr == '\0' || strcmp(passstr, "show") == 0) {
+        reply("Senha do AP: ********\n");
+      } else {
+        snprintf(config_ap_pass, sizeof(config_ap_pass), "%s", passstr);
+        replyf("Senha do AP alterada (%d caracteres).\n", strlen(config_ap_pass));
+        if (ap_mode_active) {
+          reply("NOTA: a nova senha sera usada na proxima vez que o AP for reiniciado (ap off; ap on).\n");
+        }
+        saveConfig();
+      }
+
     } else {
-      reply("Uso: ap on | ap off | ap status | ap ip | ap mac | ap ssid\n");
+      reply("Uso: ap on | ap off | ap status | ap ip | ap mac | ap ssid | ap pass\n");
     }
 
+  } else if (strcmp(cmd, "captive on") == 0) {
+    captive_enabled = true;
+    if (ap_mode_active) {
+      dnsServer.start(53, "*", WiFi.softAPIP());
+    }
+    reply("Captive portal ATIVADO. DNS redireciona para o dashboard.\n");
+  } else if (strcmp(cmd, "captive off") == 0) {
+    captive_enabled = false;
+    if (ap_mode_active) {
+      dnsServer.stop();
+    }
+    reply("Captive portal DESATIVADO. Apenas acesso direto ao IP.\n");
+  } else if (strcmp(cmd, "tcp on") == 0) {
+    if (WiFi.status() != WL_CONNECTED && !ap_mode_active) {
+      reply("WiFi nao conectado. Conecte primeiro ou use 'ap on'.\n");
+    } else {
+      iniciarTCPServer();
+      saveConfig();
+    }
+  } else if (strcmp(cmd, "tcp off") == 0) {
+    pararTCPServer();
+    saveConfig();
+  } else if (strcmp(cmd, "tcp status") == 0) {
+    if (tcp_server_active) {
+      replyf("TCP: ativo na porta 2323 (%d clientes)\n",
+             (tcpClients[0] ? 1 : 0) + (tcpClients[1] ? 1 : 0) + (tcpClients[2] ? 1 : 0));
+    } else {
+      reply("TCP: inativo. Use 'tcp on' para ativar.\n");
+    }
+  } else if (strcmp(cmd, "mqtt off") == 0) {
+    mqtt_broker_ip = IPAddress(0, 0, 0, 0);
+    if (mqttClient.connected()) mqttClient.stop();
+    mqtt_connected = false;
+    reply("MQTT desativado.\n");
+    saveConfig();
+  } else if (strncmp(cmd, "mqtt ", 5) == 0) {
+    const char *val = cmd + 5;
+    while (*val == ' ') val++;
+    if (*val == '\0') {
+      if (mqtt_broker_ip.toString() != "0.0.0.0") {
+        replyf("MQTT broker: %s:%d %s\n",
+               mqtt_broker_ip.toString().c_str(), mqtt_broker_port,
+               mqtt_connected ? "[CONECTADO]" : "[desconectado]");
+      } else {
+        reply("MQTT: desativado. Use 'mqtt <ip> [porta]' para configurar.\n");
+      }
+    } else {
+      char ipStr[16]; int port = 1883;
+      int parsed = sscanf(val, "%15s %d", ipStr, &port);
+      if (parsed >= 1 && parseIP(ipStr, mqtt_broker_ip)) {
+        if (parsed >= 2) mqtt_broker_port = port;
+        replyf("MQTT configurado: broker %s:%d\n",
+               mqtt_broker_ip.toString().c_str(), mqtt_broker_port);
+        if (mqttClient.connected()) mqttClient.stop();
+        mqtt_connected = false;
+        saveConfig();
+      } else {
+        reply("Formato invalido. Use: mqtt <ip> [porta]\n");
+      }
+    }
+  } else if (strncmp(cmd, "staticip ", 9) == 0) {
+    // Teste manual com IP estatico: staticip <ip> <gw> <mask>
+    const char *val = cmd + 9;
+    while (*val == ' ') val++;
+    IPAddress sip, sgw, smask;
+    char b1[16], b2[16], b3[16];
+    if (sscanf(val, "%15s %15s %15s", b1, b2, b3) >= 1) {
+      if (parseIP(b1, sip)) {
+        if (!parseIP(b2, sgw)) sgw = sip;
+        if (!parseIP(b3, smask)) smask = IPAddress(255, 255, 255, 0);
+        WiFi.config(sip, sgw, smask);
+        replyf("IP estatico configurado: %s/%s GW:%s\n",
+               sip.toString().c_str(), smask.toString().c_str(), sgw.toString().c_str());
+        reply("Testando ping...\n");
+        int ret = WiFi.ping(sgw, 3);
+        replyf("Ping para GW %s: %s\n", sgw.toString().c_str(),
+               ret >= 0 ? (String(ret) + " ms").c_str() : "TIMEOUT");
+      } else {
+        reply("IP invalido. Uso: staticip <ip> <gateway> <mask>\n");
+      }
+    }
+  } else if (strcmp(cmd, "monitor on") == 0) {
+    startMonitorMode();
+  } else if (strcmp(cmd, "monitor off") == 0) {
+    stopMonitorMode();
+  } else if (strcmp(cmd, "monitor status") == 0) {
+    cmdMonitorStatus();
+  } else if (strcmp(cmd, "blacklist-policy") == 0) {
+    iniciarBlacklistPolicyTest();
+  } else if (strcmp(cmd, "blacklist-policy stop") == 0) {
+    pararBlacklistPolicyTest();
+  } else if (strcmp(cmd, "ratelimit-test") == 0) {
+    iniciarRatelimitTest();
   } else if (strcmp(cmd, "debug") == 0) {
     startAPDebugMode();
 
@@ -1015,6 +2080,69 @@ void cmdSummary() {
     }
   }
 
+  // Distribuicao de fases de falha
+  unsigned long totalFalhas = phaseStats.phase_scan_fail + phaseStats.phase_auth_fail +
+      phaseStats.phase_assoc_fail + phaseStats.phase_handshake_fail +
+      phaseStats.phase_dhcp_fail + phaseStats.phase_mac_set_fail;
+  if (totalFalhas > 0) {
+    replyf("\n--- Fases de falha (%lu total) ---\n", totalFalhas);
+    replyf("  SCAN_FAIL:       %lu (%.1f%%)\n",
+           phaseStats.phase_scan_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_scan_fail / totalFalhas : 0);
+    replyf("  AUTH_FAIL:       %lu (%.1f%%)\n",
+           phaseStats.phase_auth_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_auth_fail / totalFalhas : 0);
+    replyf("  ASSOC_FAIL:      %lu (%.1f%%)\n",
+           phaseStats.phase_assoc_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_assoc_fail / totalFalhas : 0);
+    replyf("  HANDSHAKE_FAIL:  %lu (%.1f%%)\n",
+           phaseStats.phase_handshake_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_handshake_fail / totalFalhas : 0);
+    replyf("  DHCP_FAIL:       %lu (%.1f%%)\n",
+           phaseStats.phase_dhcp_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_dhcp_fail / totalFalhas : 0);
+    replyf("  MAC_SET_FAIL:    %lu (%.1f%%)\n",
+           phaseStats.phase_mac_set_fail,
+           totalFalhas > 0 ? 100.0 * phaseStats.phase_mac_set_fail / totalFalhas : 0);
+    replyf("  CONNECTED:       %lu\n", phaseStats.phase_connected);
+  }
+
+  // Testes de conectividade pos-conexao
+  if (connStats.total_tested > 0) {
+    replyf("\n--- Conectividade pos-conexao (%lu testados) ---\n", connStats.total_tested);
+    replyf("  Ping (gateway):  %lu OK / %lu falha\n", connStats.ping_ok, connStats.ping_fail);
+    replyf("  DNS (resolucao): %lu OK / %lu falha\n", connStats.dns_ok, connStats.dns_fail);
+    replyf("  HTTP (GET):      %lu OK / %lu falha\n", connStats.http_ok, connStats.http_fail);
+  }
+
+  // Estatisticas por OUI
+  if (oui_stats_count > 0) {
+    replyf("\n--- Estatisticas por OUI ---\n");
+    replyf("%-12s  %8s  %8s  %7s\n", "Perfil", "Testados", "Bloqueados", "Taxa");
+    reply("------------------------------------------\n");
+    for (int i = 0; i < oui_stats_count; i++) {
+      float taxa = oui_stats[i].testados > 0 ?
+        100.0 * oui_stats[i].bloqueados / oui_stats[i].testados : 0.0;
+      replyf("%-12s  %8lu  %8lu  %6.1f%%\n",
+             oui_stats[i].nome, oui_stats[i].testados,
+             oui_stats[i].bloqueados, taxa);
+    }
+  }
+
+  // Testes de politica ativos
+  if (timeout_test_active || ratelimit_test_active) {
+    reply("\n--- Testes de politica ativos ---\n");
+    if (timeout_test_active) {
+      replyf("  Blacklist-policy: em andamento (%d MACs)\n", timeout_test_count);
+    }
+    if (ratelimit_test_active) {
+      replyf("  Ratelimit-test: fase %d (%lu/%lu)\n",
+             ratelimit_phase + 1,
+             ratelimit_fast_total + ratelimit_slow_total,
+             (unsigned long)(RATELIMIT_MACS_PER_PHASE * 2));
+    }
+  }
+
   replyf("\nConfiguracao atual:\n");
   replyf("  SSID:   %s\n", config_ssid);
   replyf("  Senha:  ********\n");
@@ -1070,173 +2198,14 @@ void cmdDebugDump() {
 // =============================================
 void cmdReset() {
   memset(&stats, 0, sizeof(stats));
+  memset(&phaseStats, 0, sizeof(phaseStats));
+  memset(oui_stats, 0, sizeof(oui_stats));
+  oui_stats_count = 0;
+  memset(&connStats, 0, sizeof(connStats));
   blocked_count = 0;
   retest_count = 0;
   startMillis = millis();
   reply("Estatisticas e contadores resetados.\n");
-}
-
-// =============================================
-// PERSISTÊNCIA DE CONFIG NO LITTLEFS
-// =============================================
-void saveConfig() {
-  SavedConfig cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.version = SAVED_CONFIG_VERSION;
-  snprintf(cfg.ssid, sizeof(cfg.ssid), "%s", config_ssid);
-  snprintf(cfg.pass, sizeof(cfg.pass), "%s", config_pass);
-  memcpy(cfg.target_mac, config_mac_alvo, 6);
-  if (ap_config_mac_set) {
-    memcpy(cfg.ap_mac, ap_config_mac, 6);
-  }
-  cfg.ap_ip[0] = ap_config_ip[0];
-  cfg.ap_ip[1] = ap_config_ip[1];
-  cfg.ap_ip[2] = ap_config_ip[2];
-  cfg.ap_ip[3] = ap_config_ip[3];
-  cfg.ap_gateway[0] = ap_config_gateway[0];
-  cfg.ap_gateway[1] = ap_config_gateway[1];
-  cfg.ap_gateway[2] = ap_config_gateway[2];
-  cfg.ap_gateway[3] = ap_config_gateway[3];
-  cfg.ap_subnet[0] = ap_config_subnet[0];
-  cfg.ap_subnet[1] = ap_config_subnet[1];
-  cfg.ap_subnet[2] = ap_config_subnet[2];
-  cfg.ap_subnet[3] = ap_config_subnet[3];
-  snprintf(cfg.ap_ssid, sizeof(cfg.ap_ssid), "%s", config_ap_ssid);
-
-  File f = LittleFS.open(CONFIG_FILENAME, "w");
-  if (!f) {
-    reply("Erro ao salvar config!\n");
-    return;
-  }
-  f.write((uint8_t*)&cfg, sizeof(cfg));
-  f.close();
-  logf("Configuracao salva.\n");
-}
-
-void loadConfig() {
-  // Reset AP config to defaults
-  ap_config_ip = IPAddress(192, 168, 4, 1);
-  ap_config_gateway = IPAddress(192, 168, 4, 1);
-  ap_config_subnet = IPAddress(255, 255, 255, 0);
-  memset(ap_config_mac, 0, 6);
-  ap_config_mac_set = false;
-  snprintf(config_ap_ssid, sizeof(config_ap_ssid), "%s", "PicoTester");
-
-  if (!LittleFS.exists(CONFIG_FILENAME)) {
-    logln("Nenhuma config salva, usando padroes.");
-    return;
-  }
-  File f = LittleFS.open(CONFIG_FILENAME, "r");
-  if (!f) {
-    reply("Erro ao ler config salva, usando padroes.\n");
-    return;
-  }
-
-  uint8_t raw[sizeof(SavedConfig)];
-  int n = f.read(raw, sizeof(raw));
-  f.close();
-
-  // Try to read version field (first 4 bytes)
-  if (n >= 4) {
-    uint32_t ver;
-    memcpy(&ver, raw, 4);
-
-    // v3: version==3, full struct
-    if (ver == 3 && n >= (int)sizeof(SavedConfig)) {
-      SavedConfig *cfg = (SavedConfig *)raw;
-      snprintf(config_ssid, sizeof(config_ssid), "%s", cfg->ssid);
-      snprintf(config_pass, sizeof(config_pass), "%s", cfg->pass);
-      memcpy(config_mac_alvo, cfg->target_mac, 6);
-      if (memcmp(cfg->ap_mac, "\0\0\0\0\0\0", 6) != 0) {
-        memcpy(ap_config_mac, cfg->ap_mac, 6);
-        ap_config_mac_set = true;
-      }
-      ap_config_ip = IPAddress(cfg->ap_ip[0], cfg->ap_ip[1], cfg->ap_ip[2], cfg->ap_ip[3]);
-      ap_config_gateway = IPAddress(cfg->ap_gateway[0], cfg->ap_gateway[1], cfg->ap_gateway[2], cfg->ap_gateway[3]);
-      ap_config_subnet = IPAddress(cfg->ap_subnet[0], cfg->ap_subnet[1], cfg->ap_subnet[2], cfg->ap_subnet[3]);
-      snprintf(config_ap_ssid, sizeof(config_ap_ssid), "%s", cfg->ap_ssid);
-      replyf("Config v3 carregada: STA=%s, AP=%s, AP IP=%s\n",
-             config_ssid, config_ap_ssid, ap_config_ip.toString().c_str());
-      return;
-    }
-
-    // v2: version==2, expect 156 bytes
-    if (ver == 2 && n >= 156) {
-      char *s = (char *)raw;
-      memcpy(config_ssid, s + 4, 64); config_ssid[63] = '\0';
-      memcpy(config_pass, s + 68, 64); config_pass[63] = '\0';
-      memcpy(config_mac_alvo, s + 132, 6);
-      if (memcmp(s + 138, "\0\0\0\0\0\0", 6) != 0) {
-        memcpy(ap_config_mac, s + 138, 6);
-        ap_config_mac_set = true;
-      }
-      ap_config_ip = IPAddress((uint8_t)(s[144]), (uint8_t)(s[145]), (uint8_t)(s[146]), (uint8_t)(s[147]));
-      ap_config_gateway = IPAddress((uint8_t)(s[148]), (uint8_t)(s[149]), (uint8_t)(s[150]), (uint8_t)(s[151]));
-      ap_config_subnet = IPAddress((uint8_t)(s[152]), (uint8_t)(s[153]), (uint8_t)(s[154]), (uint8_t)(s[155]));
-      // ap_ssid stays at default "PicoTester"
-      replyf("Config v2 carregada: SSID=%s, AP IP=%s\n",
-             config_ssid, ap_config_ip.toString().c_str());
-      return;
-    }
-  }
-
-  // Try v1 format (no version field: ssid[64] + pass[64] + target_mac[6])
-  if (n >= 64 + 64 + 6) {
-    char old_ssid[64], old_pass[64];
-    memcpy(old_ssid, raw, 64);
-    memcpy(old_pass, raw + 64, 64);
-    memcpy(config_mac_alvo, raw + 128, 6);
-    old_ssid[63] = '\0';
-    old_pass[63] = '\0';
-    snprintf(config_ssid, sizeof(config_ssid), "%s", old_ssid);
-    snprintf(config_pass, sizeof(config_pass), "%s", old_pass);
-
-    replyf("Config v1 carregada: SSID=%s (AP IP=default)\n", config_ssid);
-    return;
-  }
-
-  reply("Config corrompida, usando padroes.\n");
-}
-
-// =============================================
-// CONVERSÃO DE STRING MAC PARA ARRAY
-// =============================================
-bool parseMAC(const char *str, uint8_t mac[6]) {
-  int vals[6];
-  if (sscanf(str, "%x:%x:%x:%x:%x:%x",
-             &vals[0], &vals[1], &vals[2],
-             &vals[3], &vals[4], &vals[5]) == 6) {
-    for (int i = 0; i < 6; i++) {
-      if (vals[i] < 0 || vals[i] > 255) return false;
-      mac[i] = (uint8_t)vals[i];
-    }
-    return true;
-  }
-  return false;
-}
-
-// =============================================
-// CONVERSÃO DE STRING IP PARA IPAddress
-// =============================================
-bool parseIP(const char *str, IPAddress &ip) {
-  unsigned int a, b, c, d;
-  if (sscanf(str, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-    if (a <= 255 && b <= 255 && c <= 255 && d <= 255) {
-      ip = IPAddress(a, b, c, d);
-      return true;
-    }
-  }
-  return false;
-}
-
-// =============================================
-// CONVERSÃO DE ARRAY MAC PARA STRING
-// =============================================
-String macToString(const uint8_t* mac) {
-  char buf[18];
-  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return String(buf);
 }
 
 // =============================================
@@ -1545,3 +2514,22 @@ void startAPDebugMode() {
 }
 
 #include "WebDashboard.h"
+
+// =============================================
+// CORE 1: WEB DASHBOARD + DNS (dedicado)
+// =============================================
+void setup1() {
+  // Core 1 nao inicializa hardware — usa o que core 0 configurou
+}
+
+void loop1() {
+  if (webActive) {
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    for (int i = 0; i < 5; i++) {
+      dnsServer.processNextRequest();
+      webServer.handleClient();
+    }
+  }
+  delay(1);
+}
