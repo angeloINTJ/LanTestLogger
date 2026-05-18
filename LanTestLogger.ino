@@ -4,6 +4,7 @@
 #include <SerialBT.h>
 #include "lwip/etharp.h"
 #include "lwip/dhcp.h"
+#include "OUI.h"
 #include "ConfigManager.h"
 
 // =============================================
@@ -430,6 +431,7 @@ void setup() {
 
   setupLittleFS();
   loadConfig();
+  ouiInit(false);  // false = busca em arquivo (sem custo de RAM)
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
@@ -545,8 +547,10 @@ void loop() {
 // =============================================
 void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome) {
   String macStr = macToString(mac);
-  logf("Testando [%s|%s] %s ... ", tipo.c_str(), ouiNome.c_str(), macStr.c_str());
-  pushEvent("test_start", macStr.c_str(), ouiNome.c_str());
+  String vendor = ouiLookupName(mac);  // fabricante real da IEEE
+  logf("Testando [%s|%s] %s (%s) ... ", tipo.c_str(), ouiNome.c_str(),
+       macStr.c_str(), vendor.c_str());
+  pushEvent("test_start", macStr.c_str(), vendor.c_str());
 
   digitalWrite(LED_BUILTIN, HIGH);
   delay(50);
@@ -559,7 +563,7 @@ void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome) {
     logln("FALHA ao definir MAC");
     pushEvent("blocked", macStr.c_str(), "MAC_SET_FAIL");
     unsigned long nowSeg = (millis() - startMillis) / 1000;
-    appendCSV(nowSeg, macStr, ouiNome, tipo, PHASE_MAC_SET_FAIL, -99, "MAC_SET_FAIL", "");
+    appendCSV(nowSeg, macStr, vendor, tipo, PHASE_MAC_SET_FAIL, -99, "MAC_SET_FAIL", "");
     phaseStats.phase_mac_set_fail++;
     if (tipo == "random") { stats.random_errors++; registrarOUIStat(ouiNome, true); }
     else if (tipo == "exact") stats.exact_errors++;
@@ -694,8 +698,8 @@ void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome) {
   // Emitir evento live
   {
     char detail[64];
-    snprintf(detail, sizeof(detail), "%s rc=%d %s",
-             phaseName(phase), reasonCode, reasonName.c_str());
+    snprintf(detail, sizeof(detail), "%s %s",
+             vendor.c_str(), phaseName(phase));
     if (conectado) {
       pushEvent("result", macStr.c_str(), detail);
     } else {
@@ -724,7 +728,7 @@ void testarMAC(const uint8_t* mac, const String &tipo, const String &ouiNome) {
   }
 
   unsigned long nowSeg = (millis() - startMillis) / 1000;
-  appendCSV(nowSeg, macStr, ouiNome, tipo, phase, reasonCode, reasonName, ip,
+  appendCSV(nowSeg, macStr, vendor, tipo, phase, reasonCode, reasonName, ip,
             connPingMs, connDnsOk, connHttpOk);
 
   WiFi.disconnect(true);
@@ -1647,6 +1651,8 @@ void executeCommand(char *cmd) {
     reply("  oui list              Lista perfis OUI disponiveis\n");
     reply("  oui <perfil>          Seleciona perfil OUI (ex: oui Apple)\n");
     reply("  oui all               Modo rotativo: alterna entre todos os OUIs\n");
+    reply("  oui info              Mostra status da base OUI IEEE\n");
+    reply("  oui ram on/off        Ativa/desativa cache RAM (115 KB)\n");
     reply("  ap on                 Ativa modo AP (Pico vira roteador)\n");
     reply("  ap off                Desativa modo AP e volta ao teste\n");
     reply("  ap status             Mostra status do AP\n");
@@ -1675,6 +1681,47 @@ void executeCommand(char *cmd) {
 
   } else if (strcmp(cmd, "reset") == 0) {
     cmdReset();
+
+  } else if (strncmp(cmd, "uploadoui ", 10) == 0) {
+    // uploadoui <filename> <size>
+    char fname[32]; unsigned long fsize;
+    if (sscanf(cmd + 10, "%31s %lu", fname, &fsize) == 2) {
+      replyf("READY %s %lu\n", fname, fsize);
+      // Ler fsize bytes raw da serial
+      File f = LittleFS.open(fname, "w");
+      if (!f) {
+        reply("ERROR: nao foi possivel criar arquivo\n");
+        return;
+      }
+      unsigned long received = 0;
+      unsigned long t0 = millis();
+      while (received < fsize && millis() - t0 < 60000) {
+        if (Serial.available()) {
+          uint8_t buf[128];
+          int n = Serial.readBytes(buf, min((unsigned long)sizeof(buf), fsize - received));
+          if (n > 0) {
+            f.write(buf, n);
+            received += n;
+            t0 = millis(); // reset timeout
+          }
+        }
+        delay(1);
+      }
+      f.close();
+      if (received == fsize) {
+        replyf("OK %lu bytes written to %s\n", received, fname);
+        // Reinicializar OUI se for oui.dat
+        if (strstr(fname, "oui.dat")) {
+          ouiInit(false);
+          replyf("OUI reinitialized: %lu entries\n", ouiGetCount());
+        }
+      } else {
+        replyf("ERROR: received %lu/%lu bytes\n", received, fsize);
+        LittleFS.remove(fname);
+      }
+    } else {
+      reply("Uso: uploadoui <filename> <size>\n");
+    }
 
   } else if (strcmp(cmd, "clearlog") == 0) {
     reply("Apagando arquivos de log...\n");
@@ -1763,6 +1810,37 @@ void executeCommand(char *cmd) {
       oui_rotativo = true;
       oui_ciclo_atual = 0;
       reply("Modo OUI rotativo ativado. Cada ciclo usara um perfil diferente.\n");
+    } else if (strcmp(val, "info") == 0) {
+      replyf("Base OUI IEEE: %s\n", ouiIsReady() ? "CARREGADA" : "NAO DISPONIVEL");
+      replyf("Entradas: %lu\n", ouiGetCount());
+      replyf("Cache RAM: %s\n", ouiRAM ? "ATIVA (115 KB)" : "desativada");
+      reply("Arquivos no LittleFS:\n");
+      replyf("  /oui.dat:       %s\n", LittleFS.exists("/oui.dat") ? "SIM" : "NAO");
+      replyf("  /ouinames.dat:  %s\n", LittleFS.exists("/ouinames.dat") ? "SIM" : "NAO");
+      // Teste rapido
+      if (ouiIsReady()) {
+        uint8_t testMAC[6] = {0x00, 0x1E, 0xC2, 0x00, 0x00, 0x01};
+        String name = ouiLookupName(testMAC);
+        replyf("Teste 00:1E:C2 -> %s\n", name.c_str());
+      }
+    } else if (strcmp(val, "ram on") == 0) {
+      if (!ouiIsReady()) {
+        reply("Base OUI nao carregada. Verifique /oui.dat no LittleFS.\n");
+      } else if (ouiRAM) {
+        reply("Cache RAM ja esta ativa.\n");
+      } else {
+        reply("Carregando 115 KB na RAM...\n");
+        ouiInit(true);
+        replyf("Cache RAM: %s (%lu entradas)\n", ouiRAM ? "OK" : "FALHA", ouiGetCount());
+      }
+    } else if (strcmp(val, "ram off") == 0) {
+      if (ouiRAM) {
+        free(ouiRAM);
+        ouiRAM = nullptr;
+        reply("Cache RAM liberada. Usando busca em arquivo.\n");
+      } else {
+        reply("Cache RAM ja esta desativada.\n");
+      }
     } else {
       // Buscar perfil por nome
       bool found = false;
